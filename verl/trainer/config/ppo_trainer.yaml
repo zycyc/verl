@@ -153,6 +153,15 @@ algorithm:
     type: fixed
     kl_coef: 0.001
 
+# Add memory configuration here
+use_memory: False  # Default to False, can be overridden via command line
+memory:
+  embedding_model: "all-MiniLM-L6-v2"
+  similarity_threshold: 0.85
+  save_freq: 100
+  load_path: null
+  max_size: 10000
+
 trainer:
   total_epochs: 30
   total_training_steps: null

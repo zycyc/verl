@@ -24,7 +24,9 @@ from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
 from copy import deepcopy
-
+import random
+import gc
+from tqdm import tqdm
 import numpy as np
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
@@ -430,6 +432,24 @@ class RayPPOTrainer(object):
 
         self._validate_config()
         self._create_dataloader()
+
+        # Initialize memory buffer
+        self.use_memory = config.get("use_memory", False)
+        if self.use_memory:
+            from verl.utils.reflection_memory_buffer import ReflectionMemoryBuffer
+
+            memory_config = config.get("memory", {})
+            self.memory_buffer = ReflectionMemoryBuffer(
+                embedding_model=memory_config.get(
+                    "embedding_model", "all-MiniLM-L6-v2"
+                ),
+                similarity_threshold=memory_config.get("similarity_threshold", 0.85),
+                save_path=os.path.join(
+                    config.trainer.default_local_dir, "memory_buffer.json"
+                ),
+                load_path=memory_config.get("load_path", None),
+            )
+            self.memory_save_freq = memory_config.get("save_freq", 100)
 
     def _validate_config(self):
         config = self.config
@@ -1012,12 +1032,292 @@ class RayPPOTrainer(object):
         )
         metrics.update(global_balance_stats)
 
+    def _process_batch_with_memory(self, batch: DataProto) -> DataProto:
+        """Process batch with memory retrieval and augmentation."""
+        if not self.use_memory:
+            return batch
+
+        # Extract prompts from the batch
+        prompts = []
+        for i in range(batch.batch["input_ids"].shape[0]):
+            input_ids = batch.batch["input_ids"][i].cpu().tolist()
+            prompt = self.tokenizer.decode(input_ids, skip_special_tokens=True)
+            prompts.append(prompt)
+
+        # Extract ground truth answers from the batch
+        ground_truths = []
+        for i in range(batch.non_tensor_batch["reward_model"].shape[0]):
+            ground_truth = batch.non_tensor_batch["reward_model"][i]["ground_truth"]
+            ground_truths.append(ground_truth)
+
+        # Check if we have memories for any of the prompts
+        augmented_prompts = []
+        memory_used = []
+
+        for i, prompt in tqdm(enumerate(prompts), desc="Processing prompts"):
+            memory_result = self.memory_buffer.retrieve_memory(prompt)
+
+            if memory_result:
+                original_question, answer, similarity = memory_result
+                if ground_truths[i] == answer:
+                    # Augment the prompt with the retrieved answer
+                    # Split the prompt at "\nassistant" to separate user and assistant parts
+                    parts = prompt.split("\nassistant", 1)
+                    user_part = parts[0]
+                    assistant_part = parts[1] if len(parts) > 1 else ""
+
+                    # Create the augmented prompt with memory information
+                    # TODO: check if this needs special tokens??
+                    augmented_prompt = (
+                        f"{user_part} You remember having seen this question and should directly output ####"
+                        + f"{answer} without any other words."
+                        + f" \nassistant"
+                        + f"{assistant_part}"
+                    )
+                    if i == 0:
+                        print("--------------------------------")
+                        print("found memory that exceeds threshold")
+                        print(f"original prompt: {original_question}")
+                        print(f"current prompt: {prompt}")
+                        print(f"ground truth: {ground_truths[i]}")
+                        print(f"retrieved answer: {answer}")
+                    # print(f"retrieval success: {ground_truths[i] == answer}")
+                    # print(f"similarity: {similarity}")
+                    # print(f"augmented prompt: {augmented_prompt}")
+                    # print("--------------------------------")
+
+                    memory_used.append(True)
+                else:
+                    augmented_prompt = prompt
+                    memory_used.append(False)
+            else:
+                augmented_prompt = prompt
+                memory_used.append(False)
+
+            augmented_prompts.append(augmented_prompt)
+
+        # print how many prompts are used memory
+        print(f"Number of prompts used memory: {sum(memory_used)}")
+
+        # Store original prompts for later use - convert to numpy arrays with dtype=object
+        batch.non_tensor_batch["original_prompts"] = np.array(prompts, dtype=object)
+        batch.non_tensor_batch["memory_used"] = np.array(memory_used, dtype=object)
+
+        # Tokenize the augmented prompts
+        augmented_inputs = self.tokenizer(
+            augmented_prompts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=self.config.data.max_prompt_length,
+        )
+
+        # Replace the input_ids and attention_mask in the batch
+        batch.batch["input_ids"] = augmented_inputs["input_ids"].to(
+            batch.batch["input_ids"].device
+        )
+        batch.batch["attention_mask"] = augmented_inputs["attention_mask"].to(
+            batch.batch["attention_mask"].device
+        )
+
+        # Update position_ids if present
+        if "position_ids" in batch.batch:
+            position_ids = (
+                torch.arange(
+                    0,
+                    augmented_inputs["input_ids"].shape[1],
+                    dtype=torch.long,
+                    device=batch.batch["position_ids"].device,
+                )
+                .unsqueeze(0)
+                .expand_as(augmented_inputs["input_ids"])
+            )
+            batch.batch["position_ids"] = position_ids
+
+        return batch
+
+    def _update_memory_with_reflection(
+        self, batch: DataProto, reward_tensor: torch.Tensor
+    ) -> None:
+        """Update memory buffer with ground truth answers for all questions."""
+        if not self.use_memory:
+            return
+
+        original_prompts = batch.non_tensor_batch.get("original_prompts", [])
+        memory_used = batch.non_tensor_batch.get(
+            "memory_used", [False] * len(original_prompts)
+        )
+        ground_truths = batch.non_tensor_batch["reward_model"]
+
+        # Process a small number of items per step
+        items_added = 0
+
+        try:
+            # Process in small batches with CUDA synchronization between each
+            for i in range(len(original_prompts)):
+                if i >= len(memory_used) or memory_used[i]:
+                    continue
+
+                if i < len(ground_truths):
+                    prompt = original_prompts[i]
+                    ground_truth = ground_truths[i]["ground_truth"]
+
+                    # Check if this memory is already in the buffer
+                    # existing = self.memory_buffer.retrieve_memory(prompt)
+                    # if not existing:
+                    # Add one memory at a time with incremental index updates
+                    self.memory_buffer.add_memory(prompt, ground_truth)
+                    items_added += 1
+
+            print(f"Added {items_added} new memories this step")
+
+            # Save periodically
+            if self.global_steps % self.memory_save_freq == 0:
+                try:
+                    self.memory_buffer.save()
+                    print("Memory buffer saved successfully")
+                except Exception as e:
+                    print(f"Error saving memory buffer: {str(e)}")
+
+        except Exception as e:
+            print(f"Error updating memory: {str(e)}")
+            import traceback
+
+            traceback.print_exc()
+
+    # def _update_memory_with_reflection(
+    #     self, batch: DataProto, reward_tensor: torch.Tensor
+    # ) -> None:
+    #     """Update memory buffer with ground truth answers for all questions."""
+    #     if not self.use_memory:
+    #         return
+
+    #     # Get original prompts
+    #     original_prompts = batch.non_tensor_batch.get("original_prompts", [])
+    #     memory_used = batch.non_tensor_batch.get(
+    #         "memory_used", [False] * len(original_prompts)
+    #     )
+
+    #     # Look for ground truth answers in the batch
+    #     ground_truths = batch.non_tensor_batch["reward_model"]
+
+    #     # Add all questions and their ground truths to memory if not already there
+    #     print(f"Adding {len(original_prompts)} memories to memory buffer")
+
+    #     # IMPORTANT: Instead of processing immediately, just collect the data to add
+    #     # This avoids potential hanging in the Ray distributed environment
+    #     new_questions = []
+    #     new_answers = []
+
+    #     try:
+    #         # Just collect what needs to be added without processing embeddings yet
+    #         for i in range(len(original_prompts)):
+    #             if i >= len(memory_used) or memory_used[i]:
+    #                 continue
+
+    #             if i < len(ground_truths):
+    #                 prompt = original_prompts[i]
+    #                 ground_truth = ground_truths[i]["ground_truth"]
+
+    #                 # Just collect the data - don't process embeddings now
+    #                 new_questions.append(prompt)
+    #                 new_answers.append(ground_truth)
+
+    #         print(f"Collected {len(new_questions)} new memories to add later")
+
+    #         # Store in buffer's raw data without computing embeddings
+    #         if new_questions:
+    #             # Just add to lists without computing embeddings
+    #             self.memory_buffer.questions.extend(new_questions)
+    #             self.memory_buffer.answers.extend(new_answers)
+
+    #             # Flag to rebuild index later
+    #             self.memory_buffer._needs_rebuild = True
+
+    #             print(
+    #                 f"Added {len(new_questions)} items to memory buffer (embeddings will be built later)"
+    #             )
+
+    #             # Periodically rebuild the index if needed, but only at certain steps
+    #             # to avoid doing it too frequently
+    #             if self.global_steps % 10 == 0 and hasattr(
+    #                 self.memory_buffer, "_needs_rebuild"
+    #             ):
+    #                 batch_size = 32
+
+    #                 # Only try to rebuild if we have questions
+    #                 if self.memory_buffer.questions:
+    #                     try:
+    #                         print(
+    #                             f"Rebuilding memory index with {len(self.memory_buffer.questions)} items"
+    #                         )
+
+    #                         # Process in small batches to avoid memory issues
+    #                         for start_idx in range(
+    #                             0, len(self.memory_buffer.questions), batch_size
+    #                         ):
+    #                             end_idx = min(
+    #                                 start_idx + batch_size,
+    #                                 len(self.memory_buffer.questions),
+    #                             )
+    #                             print(
+    #                                 f"Building embeddings for batch {start_idx}-{end_idx}"
+    #                             )
+
+    #                             # We'll modify _update_embeddings in the memory buffer to handle this batched approach
+    #                             # For now, just rebuild the whole index
+    #                             if start_idx == 0:  # Only rebuild on first batch
+    #                                 self.memory_buffer._update_embeddings()
+    #                                 print("Memory index rebuilt successfully")
+    #                                 break  # Skip remaining batches for now
+
+    #                         self.memory_buffer._needs_rebuild = False
+
+    #                     except Exception as e:
+    #                         print(f"Error rebuilding memory index: {str(e)}")
+    #                         import traceback
+
+    #                         traceback.print_exc()
+
+    #     except Exception as e:
+    #         print(f"Error collecting memories: {str(e)}")
+    #         import traceback
+
+    #         traceback.print_exc()
+
+    #     # Print memory buffer stats
+    #     try:
+    #         print(
+    #             f"Memory buffer stats: {len(self.memory_buffer.questions)} questions, {len(self.memory_buffer.answers)} answers"
+    #         )
+    #     except Exception as e:
+    #         print(f"Error reporting memory buffer stats: {str(e)}")
+
+    #     # Save memory buffer periodically (raw data only)
+    #     if self.global_steps % self.memory_save_freq == 0:
+    #         try:
+    #             print("Saving memory buffer...")
+    #             self.memory_buffer.save()
+    #             print("Memory buffer saved successfully")
+    #         except Exception as e:
+    #             print(f"Error saving memory buffer: {str(e)}")
+
+    #     # Save memory buffer periodically
+    #     # if self.global_steps % self.memory_save_freq == 0:
+    #     #     self.memory_buffer.save()
+
     def fit(self):
         """
         The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
         """
+        # Add memory management for PyTorch
+        torch.cuda.empty_cache()  # Clear cache at the start
+
+        # Set PyTorch memory allocation strategy to reduce fragmentation
+        if hasattr(torch.cuda, "memory_stats"):
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+        # Rest of the existing fit method
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
 
@@ -1054,6 +1354,11 @@ class RayPPOTrainer(object):
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
+                # Apply memory augmentation if enabled
+                if self.use_memory:
+                    with _timer("memory_retrieval", timing_raw):
+                        batch = self._process_batch_with_memory(batch)
+
                 # pop those keys for generation
                 gen_batch = batch.pop(
                     batch_keys=["input_ids", "attention_mask", "position_ids"]
@@ -1065,6 +1370,35 @@ class RayPPOTrainer(object):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(
                             gen_batch
                         )
+
+                        # Print each rollout output
+                        print("\n===== ROLLOUT OUTPUTS =====")
+                        responses = gen_batch_output.batch["responses"]
+                        input_ids = (
+                            gen_batch.batch["input_ids"]
+                            if "input_ids" in gen_batch.batch
+                            else None
+                        )
+
+                        for i in range(
+                            min(5, responses.shape[0])
+                        ):  # Print first 5 examples to avoid clutter
+                            # Print input if available
+                            if input_ids is not None:
+                                prompt = self.tokenizer.decode(
+                                    input_ids[i], skip_special_tokens=True
+                                )
+                                print(f"Prompt {i + 1}:\n{prompt}\n")
+
+                            # Print response
+                            response_text = self.tokenizer.decode(
+                                responses[i], skip_special_tokens=True
+                            )
+                            print(f"Response {i + 1}:\n{response_text}\n")
+                            print("-" * 50)
+
+                        print(f"Total responses: {responses.shape[0]}")
+                        print("==========================\n")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
@@ -1163,6 +1497,13 @@ class RayPPOTrainer(object):
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                         )
 
+                        # Update memory with reflection
+                        if self.use_memory:
+                            with _timer("memory_update", timing_raw):
+                                self._update_memory_with_reflection(
+                                    batch, reward_tensor
+                                )
+
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
@@ -1212,6 +1553,11 @@ class RayPPOTrainer(object):
 
                 self.global_steps += 1
 
+                # Add explicit garbage collection and cache clearing periodically
+                if self.global_steps % 5 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
                 if self.global_steps >= self.total_training_steps:
                     # perform validation after training
                     if self.val_reward_fn is not None:
@@ -1224,4 +1570,7 @@ class RayPPOTrainer(object):
                     ):
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint()
+                    # Save memory buffer at the end of training
+                    if self.use_memory:
+                        self.memory_buffer.save()
                     return
