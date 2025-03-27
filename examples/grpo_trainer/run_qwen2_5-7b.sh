@@ -12,7 +12,7 @@ uv run -m verl.trainer.main_ppo \
     data.train_files=$HOME/examples/processed_data/train.parquet \
     data.val_files=$HOME/examples/processed_data/test.parquet \
     data.train_batch_size=1024 \
-    data.max_prompt_length=1024 \
+    data.max_prompt_length=512 \
     data.max_response_length=500 \
     actor_rollout_ref.model.path=Qwen/Qwen2.5-7B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \

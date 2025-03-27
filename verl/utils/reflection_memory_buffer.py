@@ -83,7 +83,7 @@ class ReflectionMemoryBuffer:
             self._update_embeddings()
         else:
             # Add to memory
-            print(f"Adding question to memory buffer: {question[:50]}...")
+            # print(f"Adding question to memory buffer: {question[:50]}...")
             self.questions.append(question)
             self.answers.append(answer)
 

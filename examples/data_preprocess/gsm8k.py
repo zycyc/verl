@@ -35,6 +35,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_dir", default="~/data/gsm8k")
     parser.add_argument("--hdfs_dir", default=None)
+    parser.add_argument("--constraint_samples", type=bool, default=False)
     parser.add_argument("--max_train_samples", type=int, default=1024)
     parser.add_argument("--max_test_samples", type=int, default=128)
 
@@ -48,12 +49,13 @@ if __name__ == "__main__":
     test_dataset = dataset["test"]
 
     # Limit training data to specified number of samples
-    if len(train_dataset) > args.max_train_samples:
-        train_dataset = train_dataset.select(range(args.max_train_samples))
+    if args.constraint_samples:
+        if len(train_dataset) > args.max_train_samples:
+            train_dataset = train_dataset.select(range(args.max_train_samples))
 
-    # Limit test data to specified number of samples
-    if len(test_dataset) > args.max_test_samples:
-        test_dataset = test_dataset.select(range(args.max_test_samples))
+        # Limit test data to specified number of samples
+        if len(test_dataset) > args.max_test_samples:
+            test_dataset = test_dataset.select(range(args.max_test_samples))
 
     instruction_following = (
         'Let\'s think step by step and output the final answer after "####".'

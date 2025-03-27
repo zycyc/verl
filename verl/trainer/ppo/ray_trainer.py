@@ -1034,8 +1034,6 @@ class RayPPOTrainer(object):
 
     def _process_batch_with_memory(self, batch: DataProto) -> DataProto:
         """Process batch with memory retrieval and augmentation."""
-        if not self.use_memory:
-            return batch
 
         # Extract prompts from the batch
         prompts = []
@@ -1054,33 +1052,37 @@ class RayPPOTrainer(object):
         augmented_prompts = []
         memory_used = []
 
-        for i, prompt in tqdm(enumerate(prompts), desc="Processing prompts"):
+        for i, prompt in enumerate(prompts):
             memory_result = self.memory_buffer.retrieve_memory(prompt)
 
             if memory_result:
                 original_question, answer, similarity = memory_result
                 if ground_truths[i] == answer:
-                    # Augment the prompt with the retrieved answer
-                    # Split the prompt at "\nassistant" to separate user and assistant parts
-                    parts = prompt.split("\nassistant", 1)
-                    user_part = parts[0]
-                    assistant_part = parts[1] if len(parts) > 1 else ""
+                    user_content = prompt.split("\nuser\n", 1)[1].split("\nassistant")[
+                        0
+                    ]
+                    formatted_prompt = self.tokenizer.apply_chat_template(
+                        [
+                            {
+                                "role": "user",
+                                "content": user_content.strip()
+                                + f" Repeat '#### {answer}' without other words!",
+                            }
+                        ],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
 
                     # Create the augmented prompt with memory information
                     # TODO: check if this needs special tokens??
-                    augmented_prompt = (
-                        f"{user_part} You remember having seen this question and should directly output ####"
-                        + f"{answer} without any other words."
-                        + f" \nassistant"
-                        + f"{assistant_part}"
-                    )
-                    if i == 0:
-                        print("--------------------------------")
-                        print("found memory that exceeds threshold")
-                        print(f"original prompt: {original_question}")
-                        print(f"current prompt: {prompt}")
-                        print(f"ground truth: {ground_truths[i]}")
-                        print(f"retrieved answer: {answer}")
+                    augmented_prompt = formatted_prompt
+                    # if i == 0:
+                    #     print("--------------------------------")
+                    #     print("found memory that exceeds threshold")
+                    #     print(f"original prompt: {original_question}")
+                    #     print(f"current prompt: {prompt}")
+                    #     print(f"ground truth: {ground_truths[i]}")
+                    #     print(f"retrieved answer: {answer}")
                     # print(f"retrieval success: {ground_truths[i] == answer}")
                     # print(f"similarity: {similarity}")
                     # print(f"augmented prompt: {augmented_prompt}")
@@ -1088,10 +1090,27 @@ class RayPPOTrainer(object):
 
                     memory_used.append(True)
                 else:
-                    augmented_prompt = prompt
+                    # augmented_prompt = prompt
+                    user_content = prompt.split("\nuser\n", 1)[1].split("\nassistant")[
+                        0
+                    ]
+                    formatted_prompt = self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": user_content.strip()}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    augmented_prompt = formatted_prompt
                     memory_used.append(False)
             else:
-                augmented_prompt = prompt
+                # breakpoint()
+                # augmented_prompt = prompt
+                user_content = prompt.split("\nuser\n", 1)[1].split("\nassistant")[0]
+                formatted_prompt = self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": user_content.strip()}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                augmented_prompt = formatted_prompt
                 memory_used.append(False)
 
             augmented_prompts.append(augmented_prompt)
@@ -1104,13 +1123,17 @@ class RayPPOTrainer(object):
         batch.non_tensor_batch["memory_used"] = np.array(memory_used, dtype=object)
 
         # Tokenize the augmented prompts
+        # pad from left
+        self.tokenizer.padding_side = "left"
         augmented_inputs = self.tokenizer(
             augmented_prompts,
-            padding=True,
+            padding="max_length",
             truncation=True,
             return_tensors="pt",
             max_length=self.config.data.max_prompt_length,
         )
+        self.tokenizer.padding_side = "right"
+        # breakpoint()
 
         # Replace the input_ids and attention_mask in the batch
         batch.batch["input_ids"] = augmented_inputs["input_ids"].to(
@@ -1119,19 +1142,23 @@ class RayPPOTrainer(object):
         batch.batch["attention_mask"] = augmented_inputs["attention_mask"].to(
             batch.batch["attention_mask"].device
         )
+        # breakpoint()
 
         # Update position_ids if present
         if "position_ids" in batch.batch:
-            position_ids = (
-                torch.arange(
-                    0,
-                    augmented_inputs["input_ids"].shape[1],
-                    dtype=torch.long,
-                    device=batch.batch["position_ids"].device,
-                )
-                .unsqueeze(0)
-                .expand_as(augmented_inputs["input_ids"])
+            # Create position_ids that account for left padding
+            # For left padding, position_ids should be 0 for padding tokens and sequential for content
+            position_ids = torch.zeros_like(
+                augmented_inputs["attention_mask"],
+                dtype=torch.long,
+                device=batch.batch["position_ids"].device,
             )
+
+            # Use cumulative sum of attention mask to create proper position ids
+            # This ensures padding (0s in attention_mask) gets position_id=0
+            # and content tokens get sequential position ids starting from 0
+            position_ids = torch.cumsum(augmented_inputs["attention_mask"], dim=1) - 1
+            position_ids = torch.clamp(position_ids, min=0)
             batch.batch["position_ids"] = position_ids
 
         return batch
@@ -1154,7 +1181,7 @@ class RayPPOTrainer(object):
 
         try:
             # Process in small batches with CUDA synchronization between each
-            for i in range(len(original_prompts)):
+            for i in tqdm(range(len(original_prompts)), desc="Updating memory"):
                 if i >= len(memory_used) or memory_used[i]:
                     continue
 
@@ -1185,137 +1212,17 @@ class RayPPOTrainer(object):
 
             traceback.print_exc()
 
-    # def _update_memory_with_reflection(
-    #     self, batch: DataProto, reward_tensor: torch.Tensor
-    # ) -> None:
-    #     """Update memory buffer with ground truth answers for all questions."""
-    #     if not self.use_memory:
-    #         return
-
-    #     # Get original prompts
-    #     original_prompts = batch.non_tensor_batch.get("original_prompts", [])
-    #     memory_used = batch.non_tensor_batch.get(
-    #         "memory_used", [False] * len(original_prompts)
-    #     )
-
-    #     # Look for ground truth answers in the batch
-    #     ground_truths = batch.non_tensor_batch["reward_model"]
-
-    #     # Add all questions and their ground truths to memory if not already there
-    #     print(f"Adding {len(original_prompts)} memories to memory buffer")
-
-    #     # IMPORTANT: Instead of processing immediately, just collect the data to add
-    #     # This avoids potential hanging in the Ray distributed environment
-    #     new_questions = []
-    #     new_answers = []
-
-    #     try:
-    #         # Just collect what needs to be added without processing embeddings yet
-    #         for i in range(len(original_prompts)):
-    #             if i >= len(memory_used) or memory_used[i]:
-    #                 continue
-
-    #             if i < len(ground_truths):
-    #                 prompt = original_prompts[i]
-    #                 ground_truth = ground_truths[i]["ground_truth"]
-
-    #                 # Just collect the data - don't process embeddings now
-    #                 new_questions.append(prompt)
-    #                 new_answers.append(ground_truth)
-
-    #         print(f"Collected {len(new_questions)} new memories to add later")
-
-    #         # Store in buffer's raw data without computing embeddings
-    #         if new_questions:
-    #             # Just add to lists without computing embeddings
-    #             self.memory_buffer.questions.extend(new_questions)
-    #             self.memory_buffer.answers.extend(new_answers)
-
-    #             # Flag to rebuild index later
-    #             self.memory_buffer._needs_rebuild = True
-
-    #             print(
-    #                 f"Added {len(new_questions)} items to memory buffer (embeddings will be built later)"
-    #             )
-
-    #             # Periodically rebuild the index if needed, but only at certain steps
-    #             # to avoid doing it too frequently
-    #             if self.global_steps % 10 == 0 and hasattr(
-    #                 self.memory_buffer, "_needs_rebuild"
-    #             ):
-    #                 batch_size = 32
-
-    #                 # Only try to rebuild if we have questions
-    #                 if self.memory_buffer.questions:
-    #                     try:
-    #                         print(
-    #                             f"Rebuilding memory index with {len(self.memory_buffer.questions)} items"
-    #                         )
-
-    #                         # Process in small batches to avoid memory issues
-    #                         for start_idx in range(
-    #                             0, len(self.memory_buffer.questions), batch_size
-    #                         ):
-    #                             end_idx = min(
-    #                                 start_idx + batch_size,
-    #                                 len(self.memory_buffer.questions),
-    #                             )
-    #                             print(
-    #                                 f"Building embeddings for batch {start_idx}-{end_idx}"
-    #                             )
-
-    #                             # We'll modify _update_embeddings in the memory buffer to handle this batched approach
-    #                             # For now, just rebuild the whole index
-    #                             if start_idx == 0:  # Only rebuild on first batch
-    #                                 self.memory_buffer._update_embeddings()
-    #                                 print("Memory index rebuilt successfully")
-    #                                 break  # Skip remaining batches for now
-
-    #                         self.memory_buffer._needs_rebuild = False
-
-    #                     except Exception as e:
-    #                         print(f"Error rebuilding memory index: {str(e)}")
-    #                         import traceback
-
-    #                         traceback.print_exc()
-
-    #     except Exception as e:
-    #         print(f"Error collecting memories: {str(e)}")
-    #         import traceback
-
-    #         traceback.print_exc()
-
-    #     # Print memory buffer stats
-    #     try:
-    #         print(
-    #             f"Memory buffer stats: {len(self.memory_buffer.questions)} questions, {len(self.memory_buffer.answers)} answers"
-    #         )
-    #     except Exception as e:
-    #         print(f"Error reporting memory buffer stats: {str(e)}")
-
-    #     # Save memory buffer periodically (raw data only)
-    #     if self.global_steps % self.memory_save_freq == 0:
-    #         try:
-    #             print("Saving memory buffer...")
-    #             self.memory_buffer.save()
-    #             print("Memory buffer saved successfully")
-    #         except Exception as e:
-    #             print(f"Error saving memory buffer: {str(e)}")
-
-    #     # Save memory buffer periodically
-    #     # if self.global_steps % self.memory_save_freq == 0:
-    #     #     self.memory_buffer.save()
-
     def fit(self):
         """
         The training loop of PPO.
         """
-        # Add memory management for PyTorch
-        torch.cuda.empty_cache()  # Clear cache at the start
+        if self.use_memory:
+            # Add memory management for PyTorch
+            torch.cuda.empty_cache()  # Clear cache at the start
 
-        # Set PyTorch memory allocation strategy to reduce fragmentation
-        if hasattr(torch.cuda, "memory_stats"):
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            # Set PyTorch memory allocation strategy to reduce fragmentation
+            if hasattr(torch.cuda, "memory_stats"):
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
         # Rest of the existing fit method
         from verl.utils.tracking import Tracking
@@ -1367,10 +1274,11 @@ class RayPPOTrainer(object):
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
+                        print("before gen")
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(
                             gen_batch
                         )
-
+                        print("after gen")
                         # Print each rollout output
                         print("\n===== ROLLOUT OUTPUTS =====")
                         responses = gen_batch_output.batch["responses"]
@@ -1498,11 +1406,13 @@ class RayPPOTrainer(object):
                         )
 
                         # Update memory with reflection
+                        print("before update memory")
                         if self.use_memory:
                             with _timer("memory_update", timing_raw):
                                 self._update_memory_with_reflection(
                                     batch, reward_tensor
                                 )
+                        print("after update memory")
 
                     # update critic
                     if self.use_critic:
@@ -1554,7 +1464,8 @@ class RayPPOTrainer(object):
                 self.global_steps += 1
 
                 # Add explicit garbage collection and cache clearing periodically
-                if self.global_steps % 5 == 0:
+                # if self.use_memory and self.global_steps % 5 == 0:
+                if self.use_memory:
                     gc.collect()
                     torch.cuda.empty_cache()
 
