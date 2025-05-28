@@ -1,7 +1,7 @@
 set -x
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
-HOME=/data/alan-g491/verl
+HOME=/remote/alan/verl
 export WANDB_API_KEY=5fb2c3eb35cb3bc0124a02069ce91eedc6570e5a
 
 export CUDA_LAUNCH_BLOCKING=1

@@ -113,4 +113,4 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 *.swp
 
 # ckpt
-*.lock
+# *.lock # need uv lock file to be committed
