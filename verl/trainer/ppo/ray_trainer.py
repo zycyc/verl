@@ -49,6 +49,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+import re
 
 WorkerType = Type[Worker]
 
@@ -1054,19 +1055,21 @@ class RayPPOTrainer(object):
         memory_used = []
 
         for i, prompt in enumerate(prompts):
-            memory_result = self.memory_buffer.retrieve_memory(prompt)
+            question = prompt.split("\nuser\n", 1)[1].split("\nassistant")[0]
+            memory_result = self.memory_buffer.retrieve_memory(question)
+            if i < 5 and memory_result:
+                print(f"Question {i} memory retrieved")
+            elif i < 5 and not memory_result:
+                print(f"Question {i} no memory retrieved")
 
             if memory_result:
                 original_question, reflection, similarity = memory_result
-
-                # Extract the core user question from the prompt
-                user_content = prompt.split("\nuser\n", 1)[1].split("\nassistant")[0]
 
                 # Create an augmented prompt that includes previous reflections
                 if reflection and similarity > 0.9:  # High confidence match
                     # Format a prompt that includes reflections from previous attempts
                     formatted_prompt = self._format_prompt_with_reflection(
-                        user_content.strip(), reflection, ground_truths[i]
+                        question.strip(), reflection, ground_truths[i]
                     )
 
                     augmented_prompts.append(formatted_prompt)
@@ -1074,7 +1077,7 @@ class RayPPOTrainer(object):
                 else:
                     # Standard formatting without reflection
                     formatted_prompt = self.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": user_content.strip()}],
+                        [{"role": "user", "content": question.strip()}],
                         tokenize=False,
                         add_generation_prompt=True,
                     )
@@ -1082,9 +1085,8 @@ class RayPPOTrainer(object):
                     memory_used.append(False)
             else:
                 # No memory found - use regular prompt
-                user_content = prompt.split("\nuser\n", 1)[1].split("\nassistant")[0]
                 formatted_prompt = self.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": user_content.strip()}],
+                    [{"role": "user", "content": question.strip()}],
                     tokenize=False,
                     add_generation_prompt=True,
                 )
@@ -1134,7 +1136,7 @@ class RayPPOTrainer(object):
 
         return batch
 
-    def _format_prompt_with_reflection(self, user_content, reflection, ground_truth):
+    def _format_prompt_with_reflection(self, question, reflection, ground_truth):
         """Format a prompt that includes previous reflection information."""
         # Count how many attempts have been made based on reflection
         attempt_count = reflection.count("--- ATTEMPT ")
@@ -1152,7 +1154,7 @@ class RayPPOTrainer(object):
         formatted_prompt = self.tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": system_message},
-                {"role": "user", "content": user_content},
+                {"role": "user", "content": question},
             ],
             tokenize=False,
             add_generation_prompt=True,
@@ -1178,76 +1180,96 @@ class RayPPOTrainer(object):
         items_updated = 0
 
         try:
-            # Process each item individually
-            for i in tqdm(range(len(original_prompts)), desc="Updating memory with reflections"):
+            # Batch process all items at once instead of one by one
+            print(f"Processing {len(original_prompts)} items for memory updates...")
+            
+            # Decode all responses at once
+            model_responses = []
+            for i in range(len(original_prompts)):
+                if i < len(responses):
+                    model_response = self.tokenizer.decode(
+                        responses[i], skip_special_tokens=True
+                    )
+                    model_responses.append(model_response)
+                else:
+                    model_responses.append("")
+
+            # Extract all data needed for reflection generation
+            reflection_data = []
+            for i in range(len(original_prompts)):
                 if i >= len(memory_used) or i >= len(ground_truths):
                     continue
 
                 prompt = original_prompts[i]
+                question = prompt.split("\nuser\n", 1)[1].split("\nassistant")[0]
                 ground_truth = ground_truths[i]["ground_truth"]
-                model_response = self.tokenizer.decode(
-                    responses[i], skip_special_tokens=True
-                )
+                model_response = model_responses[i]
                 item_reward = reward_tensor[i].sum().item()
                 success = item_reward > 0
 
                 # Check if we already have this prompt in memory
-                existing_reflection = self.memory_buffer.retrieve_memory(prompt)
+                existing_reflection = self.memory_buffer.retrieve_memory(question)
 
                 if existing_reflection:
-                    print(f"Step {i}: Existing reflection found for prompt: {prompt[:100]}")
-                    # We have previous attempts - create a reflection that builds on them
-                    original_question, previous_reflection, similarity = (
-                        existing_reflection
-                    )
-
-                    # Generate a reflection that includes previous attempts
+                    original_question, previous_reflection, similarity = existing_reflection
                     reflection_prompt = self._create_iterative_reflection_prompt(
-                        prompt,
+                        question,
                         model_response,
                         ground_truth,
                         success,
                         previous_reflection,
-                        memory_used[i],  # Whether we used memory for this attempt
+                        memory_used[i],
                     )
-
-                    # Generate the reflection
-                    new_reflection = self._generate_reflection(reflection_prompt)
-
-                    # Combine previous reflection with new one
-                    combined_reflection = f"{previous_reflection}\n\n--- ATTEMPT {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n{new_reflection}"
-
-                    # Update the memory
-                    self.memory_buffer.add_memory(prompt, combined_reflection)
-                    items_updated += 1
-
+                    reflection_data.append({
+                        'index': i,
+                        'question': question,
+                        'reflection_prompt': reflection_prompt,
+                        'previous_reflection': previous_reflection,
+                        'is_update': True
+                    })
                 else:
-                    print("-" * 100)
-                    print(f"Step {i}: No existing reflection found for prompt:\n{prompt}\n")
-                    print(f"Step {i}: model response:\n{model_response}\n")
-                    # First time seeing this prompt
                     reflection_prompt = self._create_iterative_reflection_prompt(
-                        prompt, model_response, ground_truth, success, "", False
+                        question, model_response, ground_truth, success, "", False
                     )
-                    print(f"Step {i}: ground truth: {ground_truth}\n")
-                    print(f"Step {i}: success: {success}\n")
-                    print(f"Step {i}: Reflection prompt:\n{reflection_prompt}\n")
+                    reflection_data.append({
+                        'index': i,
+                        'question': question,
+                        'reflection_prompt': reflection_prompt,
+                        'previous_reflection': "",
+                        'is_update': False
+                    })
+
+            # Generate all reflections in batch
+            if reflection_data:
+                print(f"Generating {len(reflection_data)} reflections in batch...")
+                batch_reflections = self._generate_reflections_batch([item['reflection_prompt'] for item in reflection_data])
+                
+                # Update memory with all generated reflections
+                for i, reflection_item in enumerate(reflection_data):
+                    reflection = batch_reflections[i] if i < len(batch_reflections) else "Failed to generate reflection"
                     
-                    reflection = self._generate_reflection(reflection_prompt)
+                    if reflection_item['is_update']:
+                        # Update existing memory
+                        combined_reflection = f"{reflection_item['previous_reflection']}\n\n--- ATTEMPT {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n{reflection}"
+                        # if i % 100 == 0:
+                        #     print("-" * 100)
+                        #     print(f"Step {i}: Previous Reflection:\n{reflection_item['previous_reflection']}")
+                        #     print(f"Step {i}: New Reflection:\n{reflection}")
+                        #     print("-" * 100)
+                        self.memory_buffer.add_memory(reflection_item['question'], combined_reflection)
+                        items_updated += 1
+                    else:
+                        # Add new memory
+                        formatted_reflection = f"--- ATTEMPT {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n{reflection}"
+                        # if i % 100 == 0:
+                        #     print("-" * 100)
+                        #     print(f"Step {i}: Reflection Prompt: {reflection_item['reflection_prompt']}")
+                        #     print(f"Step {i}: Reflection: {reflection}")
+                        #     print("-" * 100)
+                        self.memory_buffer.add_memory(reflection_item['question'], formatted_reflection)
+                        items_added += 1
 
-                    print(f"Step {i}: Reflection:\n{reflection}\n")
-                    print("-" * 100)
-
-                    # Format as first attempt
-                    formatted_reflection = f"--- ATTEMPT {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n{reflection}"
-
-                    # Add to memory
-                    self.memory_buffer.add_memory(prompt, formatted_reflection)
-                    items_added += 1
-
-            print(
-                f"Memory updates: added {items_added} new entries, updated {items_updated} existing entries"
-            )
+            print(f"Memory updates: added {items_added} new entries, updated {items_updated} existing entries")
 
             # Save periodically
             if self.global_steps % self.memory_save_freq == 0:
@@ -1265,7 +1287,7 @@ class RayPPOTrainer(object):
 
     def _create_iterative_reflection_prompt(
         self,
-        original_prompt,
+        question,
         model_response,
         ground_truth,
         success,
@@ -1273,12 +1295,23 @@ class RayPPOTrainer(object):
         used_memory,
     ):
         """Create a prompt for the model to reflect on its performance while considering previous attempts."""
+        def extract_solution(response):
+            solution = re.search("#### (\\-?[0-9\\.\\,]+)", response)
+            if solution is not None:
+                final_solution = solution.group(0)
+                final_solution = final_solution.split("#### ")[1].replace(",", "")
+                return final_solution
+            elif "#### " in response:
+                return response.split("#### ")[-1]
+            else:
+                return ""
+        final_solution = extract_solution(model_response)
         
         if used_memory and previous_reflection:
             # This is a follow-up attempt with previous reflections
             return f"""As an AI assistant, reflect on your performance for this question that you've attempted before:
 
-Question: {original_prompt}
+Question: {question}
 
 Your previous reflections on this question:
 {previous_reflection}
@@ -1287,7 +1320,7 @@ This time, you used the above reflections from memory to guide your approach.
 
 Your latest answer: {model_response}
 
-Correct answer: {ground_truth}
+Your final solution (after ####): {final_solution}
 
 Success: {success}
 
@@ -1303,11 +1336,11 @@ Reflection:"""
             # This is the first attempt at this question
             return f"""As an AI assistant, reflect on your performance for this question:
 
-Question: {original_prompt}
+Question: {question}
 
 Your answer: {model_response}
 
-Correct answer: {ground_truth}
+Your final solution (after ####): {final_solution}
 
 Success: {success}
 
@@ -1319,20 +1352,26 @@ Please provide a concise reflection on this attempt:
 
 Reflection:"""
 
-    def _generate_reflection(self, reflection_prompt):
-        """Use the actor model to generate a reflection."""
+    def _generate_reflections_batch(self, reflection_prompts):
+        """Generate multiple reflections in a single batch for efficiency."""
         try:
-            # Format the reflection prompt using chat template so model responds as assistant
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": reflection_prompt.strip()}],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            if not reflection_prompts:
+                return []
+                
+            # Format all prompts using chat template
+            formatted_prompts = []
+            for prompt in reflection_prompts:
+                formatted_prompt = self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt.strip()}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                formatted_prompts.append(formatted_prompt)
             
-            # Tokenize the formatted prompt
+            # Tokenize all prompts at once
             self.tokenizer.padding_side = "left"
-            encoded_input = self.tokenizer(
-                formatted_prompt,
+            encoded_inputs = self.tokenizer(
+                formatted_prompts,
                 return_tensors="pt",
                 padding="max_length",
                 truncation=True,
@@ -1340,18 +1379,28 @@ Reflection:"""
             )
             self.tokenizer.padding_side = "right"
             
-            # Create DataProto properly
+            # Create DataProto for batch
             reflection_dict = {
-                "input_ids": encoded_input["input_ids"],
-                "attention_mask": encoded_input["attention_mask"],
+                "input_ids": encoded_inputs["input_ids"],
+                "attention_mask": encoded_inputs["attention_mask"],
             }
             
-            # Add position_ids if needed
-            reflection_dict["position_ids"] = torch.arange(
-                encoded_input["input_ids"].size(1), 
-                dtype=torch.long, 
-                device=encoded_input["input_ids"].device
-            ).unsqueeze(0).expand_as(encoded_input["input_ids"])
+            # Add position_ids
+            batch_size, seq_len = encoded_inputs["input_ids"].shape
+            position_ids = torch.arange(seq_len, dtype=torch.long, device=encoded_inputs["input_ids"].device)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+            
+            # For left padding, adjust position_ids to start from 0 for actual content
+            # TODO: check here
+            for i in range(batch_size):
+                # Find first non-pad token
+                first_token_pos = (encoded_inputs["attention_mask"][i] == 1).nonzero(as_tuple=True)[0]
+                if len(first_token_pos) > 0:
+                    start_pos = first_token_pos[0].item()
+                    position_ids[i, :start_pos] = 0
+                    position_ids[i, start_pos:] = torch.arange(seq_len - start_pos, dtype=torch.long)
+            
+            reflection_dict["position_ids"] = position_ids
             
             reflection_batch = DataProto.from_single_dict(reflection_dict)
 
@@ -1365,7 +1414,7 @@ Reflection:"""
                 "recompute_log_prob": False,
             }
 
-            # Generate reflection with proper padding
+            # Generate reflections with proper padding
             reflection_batch_padded, pad_size = pad_dataproto_to_divisor(
                 reflection_batch, self.actor_rollout_wg.world_size
             )
@@ -1376,17 +1425,24 @@ Reflection:"""
             
             reflection_output = unpad_dataproto(reflection_output_padded, pad_size=pad_size)
 
-            # Decode the generated reflection
-            reflection_ids = reflection_output.batch["responses"][0]
-            reflection_text = self.tokenizer.decode(
-                reflection_ids, skip_special_tokens=True
-            )
+            # Decode all generated reflections
+            reflections = []
+            responses_batch = reflection_output.batch["responses"]
+            for i in range(len(reflection_prompts)):
+                if i < len(responses_batch):
+                    reflection_text = self.tokenizer.decode(
+                        responses_batch[i], skip_special_tokens=True
+                    )
+                    # print(f"in _generate_reflections_batch, decoded reflection_text:\n{reflection_text.strip()}")
+                    reflections.append(reflection_text.strip())
+                else:
+                    reflections.append("Failed to generate reflection")
 
-            return reflection_text.strip()
+            return reflections
             
         except Exception as e:
-            print(f"Error generating reflection: {str(e)}")
-            return f"Failed to generate reflection due to error: {str(e)}"
+            print(f"Error generating batch reflections: {str(e)}")
+            return ["Failed to generate reflection due to error"] * len(reflection_prompts)
 
     def fit(self):
         """
@@ -1450,11 +1506,11 @@ Reflection:"""
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
-                        print("before gen")
+                        # print("before gen")
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(
                             gen_batch
                         )
-                        print("after gen")
+                        # print("after gen")
                         # Print each rollout output
                         print("\n===== ROLLOUT OUTPUTS =====")
                         responses = gen_batch_output.batch["responses"]
@@ -1582,13 +1638,11 @@ Reflection:"""
                         )
 
                         # Update memory with reflection
-                        print("before update memory")
                         if self.use_memory:
                             with _timer("memory_update", timing_raw):
                                 self._update_memory_with_reflection(
                                     batch, reward_tensor
                                 )
-                        print("after update memory")
 
                     # update critic
                     if self.use_critic:

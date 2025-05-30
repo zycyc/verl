@@ -12,8 +12,8 @@ uv run -m verl.trainer.main_ppo \
     data.train_files=$HOME/examples/processed_data/train.parquet \
     data.val_files=$HOME/examples/processed_data/test.parquet \
     data.train_batch_size=1024 \
-    data.max_prompt_length=512 \
-    data.max_response_length=500 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=1024 \
     actor_rollout_ref.model.path=Qwen/Qwen2.5-7B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -34,14 +34,14 @@ uv run -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
-    trainer.logger=['console'] \
+    trainer.logger=['console','wandb'] \
     trainer.project_name='reflection' \
     trainer.experiment_name='qwen2.5_7b_function_rm' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=20 \
+    trainer.total_epochs=2000 \
     use_memory=true \
     memory.embedding_model="all-MiniLM-L6-v2" \
     memory.similarity_threshold=0.95 \

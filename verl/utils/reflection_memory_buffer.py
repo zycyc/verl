@@ -69,8 +69,11 @@ class ReflectionMemoryBuffer:
         """
         # Check if this question is already in the buffer (avoid duplicates)
         if question in self.questions:
-            # Question already exists, do nothing
-            # print(f"Question already exists in memory buffer: {question[:50]}...")
+            # Question already exists, update the corresponding answer
+            idx = self.questions.index(question)
+            old_answer = self.answers[idx]
+            self.answers[idx] = answer
+            # print(f"Updated answer for existing question in memory buffer: {question[:50]}...", old_answer[:50], "->", answer[:50])
             return
 
         # Check if we need to remove old entries
