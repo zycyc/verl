@@ -169,16 +169,20 @@ actor_rollout_ref:
     grad_clip: 1.0
 
     # PPO clip ratio
-    clip_ratio: 0.2
+    # clip_ratio: 0.2
+    clip_ratio: 1000
 
     # Lower bound for asymmetric clipping (used in dual-clip PPO)
-    clip_ratio_low: 0.2
+    # clip_ratio_low: 0.2
+    clip_ratio_low: 1000
 
     # Upper bound for asymmetric clipping (used in dual-clip PPO)
-    clip_ratio_high: 0.2
+    # clip_ratio_high: 0.2
+    clip_ratio_high: 1000
 
     # Constant C in Dual-clip PPO; clips when advantage < -C
-    clip_ratio_c: 3.0
+    # clip_ratio_c: 3.0
+    clip_ratio_c: 1000
 
     # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
     loss_agg_mode: token-mean

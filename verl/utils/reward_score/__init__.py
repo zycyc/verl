@@ -16,7 +16,7 @@
 from verl.utils.import_utils import deprecated
 
 
-def default_compute_score(data_source, solution_str, ground_truth, extra_info=None, sandbox_fusion_url=None, concurrent_semaphore=None):
+def default_compute_score(data_source, solution_str, ground_truth, extra_info=None, sandbox_fusion_url=None, concurrent_semaphore=None, mode="training"):
     """Compute the score for a given solution based on the data source.
 
     Args:
@@ -24,6 +24,9 @@ def default_compute_score(data_source, solution_str, ground_truth, extra_info=No
         solution_str (str): The solution string to be evaluated.
         ground_truth (str): The ground truth answer for comparison.
         extra_info (dict, optional): Additional information that might be needed for scoring. Defaults to None.
+        sandbox_fusion_url (str, optional): URL for sandbox fusion. Defaults to None.
+        concurrent_semaphore: Semaphore for controlling concurrent access. Defaults to None.
+        mode (str): Mode for scoring - "training" or "evaluation". Defaults to "training".
 
     Returns:
         float: The computed score as a floating point number. If the result is a dictionary,
@@ -35,7 +38,12 @@ def default_compute_score(data_source, solution_str, ground_truth, extra_info=No
     if data_source == "openai/gsm8k":
         from . import gsm8k
 
-        res = gsm8k.compute_score(solution_str, ground_truth)
+        if mode == "training":
+            # Use more lenient scoring during training
+            res = gsm8k.compute_score_training(solution_str, ground_truth)
+        else:
+            # Use strict scoring during evaluation
+            res = gsm8k.compute_score(solution_str, ground_truth)
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval"]:
         from . import math
 
