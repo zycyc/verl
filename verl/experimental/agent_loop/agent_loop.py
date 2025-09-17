@@ -16,6 +16,7 @@ import heapq
 import logging
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
@@ -379,6 +380,10 @@ class AgentLoopWorker:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        total_start = time.perf_counter()
+        
+        # Time configuration setup
+        config_start = time.perf_counter()
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -400,18 +405,51 @@ class AgentLoopWorker:
             index = batch.non_tensor_batch["index"]
         else:
             index = np.arange(len(batch))
+        config_end = time.perf_counter()
 
+        # Time trajectory info computation
+        trajectory_start = time.perf_counter()
         trajectory_info = await get_trajectory_info(
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
+        trajectory_end = time.perf_counter()
 
+        # Time task creation and execution
+        task_prep_start = time.perf_counter()
         tasks = []
         for i in range(len(batch)):
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
             tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
+        task_prep_end = time.perf_counter()
+        
+        # Time the actual agent loop execution
+        agent_execution_start = time.perf_counter()
         outputs = await asyncio.gather(*tasks)
+        agent_execution_end = time.perf_counter()
 
+        # Time postprocessing
+        postprocess_start = time.perf_counter()
         output = self._postprocess(outputs)
+        postprocess_end = time.perf_counter()
+        
+        total_end = time.perf_counter()
+
+        # Add timing breakdown to output metadata
+        timing_breakdown = {
+            "agent_loop_worker_total_time": total_end - total_start,
+            "agent_loop_worker_config_time": config_end - config_start,
+            "agent_loop_worker_trajectory_time": trajectory_end - trajectory_start,
+            "agent_loop_worker_task_prep_time": task_prep_end - task_prep_start,
+            "agent_loop_worker_execution_time": agent_execution_end - agent_execution_start,
+            "agent_loop_worker_postprocess_time": postprocess_end - postprocess_start,
+            "agent_loop_worker_batch_size": len(batch)
+        }
+        
+        # Add to output metadata
+        if "timing" not in output.meta_info:
+            output.meta_info["timing"] = {}
+        output.meta_info["timing"].update(timing_breakdown)
+
         return output
 
     async def _run_agent_loop(

@@ -31,6 +31,8 @@ from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
 
+from memupdate.tools.base_memory_tool import MemoryBrokerActor, MemoryStoreManager
+
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
@@ -291,24 +293,34 @@ class TaskRunner:
         
         # MEMUPDATE: Initialize MemoryBrokerActor BEFORE worker initialization
         # This ensures workers can register their embedding models during init_workers()
-        from memupdate.tools.base_memory_tool import MemoryBrokerActor
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+        
+        
+        # MemoryBrokerActor sharding - read from config with fallback to default
+        num_shards = config.get("memupdate", {}).get("memory_broker_shards", 32)
+        MemoryStoreManager.configure_sharding(num_shards)
         
         # Get a GPU node from Ray cluster
         gpu_nodes = [node for node in ray.nodes() if node.get("Alive", False) and node.get("Resources", {}).get("GPU", 0) > 0]
         
-        # MemoryBrokerActor is just a registry - no GPU needed
-        print(f"🏢 Creating MemoryBrokerActor (registry only - no GPU allocation needed)")
-        memory_broker_actor = MemoryBrokerActor.options(
-            name="memory_broker",
-            lifetime="detached",
-            num_cpus=1
-        ).remote()
+        memory_broker_actors = []
+        for shard_id in range(num_shards):
+            actor_name = f"memory_broker_{shard_id}"
+            memory_broker_actor = MemoryBrokerActor.options(
+                name=actor_name,
+                lifetime="detached",
+                num_cpus=1
+            ).remote()
+            memory_broker_actors.append(memory_broker_actor)
+            print(f"✅ Created {actor_name}")
         
-        conversation_stats = ray.get(memory_broker_actor.get_conversation_stats.remote())        
+        # Pre-cache all shard actors in MemoryStoreManager to avoid race conditions
+        MemoryStoreManager.initialize_shard_cache()
+        
+        # Get stats from first shard as representative
+        conversation_stats = ray.get(memory_broker_actors[0].get_conversation_stats.remote())        
         for k, v in conversation_stats.items():
-            print(f"Initial {k}: {v}")
-        print(f"🏢 Initialized MemoryBrokerActor before worker initialization!")
+            print(f"First shard {k}: {v}")
+        print(f"🏢 Initialized {num_shards} sharded MemoryBrokerActors!")
         
         # Initialize the workers of the trainer.
         trainer.init_workers()

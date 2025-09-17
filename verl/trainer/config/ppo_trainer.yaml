@@ -367,3 +367,9 @@ ray_kwargs:
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
+
+# MemUpdate-specific configurations
+memupdate:
+
+  # Number of memory broker shards for distributed memory management
+  memory_broker_shards: 32
