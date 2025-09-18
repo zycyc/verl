@@ -91,13 +91,14 @@ class ToolAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            # decode_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-            # print(f"🔧 MEMUPDATE DEBUG: Generated prompt: {decode_prompt}")
+            # decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+            # print(f"🔧 MEMUPDATE DEBUG: Generated prompt: {decoded_prompt}")
         response_mask, response_logprobs = [], []
         tools_kwargs = kwargs.get("tools_kwargs", {})
         extra_info = kwargs.get("extra_info", {})
         raw_namespace = extra_info.get("namespace", "")
         sample_id = extra_info.get("sample_id", "")
+        target_answer = extra_info.get("target_answer", "")
         trial_namespace = raw_namespace + "-" + request_id[:8]
 
         # 🔧 MEMUPDATE: Create trial-specific namespace and pre-initialize memory store
@@ -132,19 +133,27 @@ class ToolAgentLoop(AgentLoopBase):
 
             # reach max response length
             if len(response_mask) >= self.response_length:
+                decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                print(f"🤖 Reached max response length: {self.response_length}, stopping.\n➡️➡️➡️Full prompt: {decoded_prompt}.\nTarget answer: {target_answer}")
                 break
 
             # reach max assistant turns
             if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
+                decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                print(f"🤖 Reached max assistant turns: {self.max_assistant_turns}, stopping.\n➡️➡️➡️Full prompt: {decoded_prompt}.\nTarget answer: {target_answer}")
                 break
 
             # reach max user turns
             if self.max_user_turns and user_turns >= self.max_user_turns:
+                decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                print(f"🤖 Reached max user turns: {self.max_user_turns}, stopping.\n➡️➡️➡️Full prompt: {decoded_prompt}.\nTarget answer: {target_answer}")
                 break
 
             # no tool calls
-            _, tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
+            content, tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
             if not tool_calls:
+                decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                print(f"🤖 No tool calls found, stopping.\n➡️➡️➡️Full prompt: {decoded_prompt}.\nTarget answer: {target_answer}")
                 break
 
             # call tools

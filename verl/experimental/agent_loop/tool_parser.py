@@ -90,6 +90,8 @@ class HermesToolParser(ToolParser):
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
             return text, []
 
+        # zycyc debug prints
+        # print(f"🤖 Extracting tool calls from text: {text}")
         matches = self.tool_call_regex.findall(text)
         function_calls = []
         for match in matches:
@@ -98,8 +100,8 @@ class HermesToolParser(ToolParser):
                 name, arguments = function_call["name"], function_call["arguments"]
                 function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
             except Exception as e:
+                # print(f"Failed to decode tool call: {e}, text: {match}")
                 continue
-                # logger.error(f"Failed to decode tool call: {e}, text: {match}")
 
         # remaing text exclude tool call tokens
         content = self.tool_call_regex.sub("", text)
