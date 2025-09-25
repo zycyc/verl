@@ -197,6 +197,12 @@ trainer:
   # Number of generations to log during validation
   log_val_generations: 0
 
+  # Number of training samples to log periodically (0 to disable)
+  log_train_generations: 0
+
+  # Frequency for logging training samples (in steps)
+  log_train_freq: 100
+
   # Directory for logging rollout data; no dump if null
   rollout_data_dir: null
 

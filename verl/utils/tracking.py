@@ -272,33 +272,33 @@ class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
 
-    def log(self, loggers, samples, step):
+    def log(self, loggers, samples, step, prefix="generations/val"):
         if "wandb" in loggers:
-            self.log_generations_to_wandb(samples, step)
+            self.log_generations_to_wandb(samples, step, prefix)
         if "swanlab" in loggers:
-            self.log_generations_to_swanlab(samples, step)
+            self.log_generations_to_swanlab(samples, step, prefix)
         if "mlflow" in loggers:
-            self.log_generations_to_mlflow(samples, step)
+            self.log_generations_to_mlflow(samples, step, prefix)
 
         if "clearml" in loggers:
-            self.log_generations_to_clearml(samples, step)
+            self.log_generations_to_clearml(samples, step, prefix)
         if "tensorboard" in loggers:
-            self.log_generations_to_tensorboard(samples, step)
+            self.log_generations_to_tensorboard(samples, step, prefix)
 
         if "vemlp_wandb" in loggers:
-            self.log_generations_to_vemlp_wandb(samples, step)
+            self.log_generations_to_vemlp_wandb(samples, step, prefix)
 
-    def log_generations_to_vemlp_wandb(self, samples, step):
+    def log_generations_to_vemlp_wandb(self, samples, step, prefix="generations/val"):
         from volcengine_ml_platform import wandb as vemlp_wandb
 
-        self._log_generations_to_wandb(samples, step, vemlp_wandb)
+        self._log_generations_to_wandb(samples, step, vemlp_wandb, prefix)
 
-    def log_generations_to_wandb(self, samples, step):
+    def log_generations_to_wandb(self, samples, step, prefix="generations/val"):
         import wandb
 
-        self._log_generations_to_wandb(samples, step, wandb)
+        self._log_generations_to_wandb(samples, step, wandb, prefix)
 
-    def _log_generations_to_wandb(self, samples, step, wandb):
+    def _log_generations_to_wandb(self, samples, step, wandb, prefix="generations/val"):
         """Log samples to wandb as a table"""
 
         # Create column names for all samples
@@ -306,13 +306,17 @@ class ValidationGenerationsLogger:
             [[f"input_{i + 1}", f"output_{i + 1}", f"score_{i + 1}"] for i in range(len(samples))], []
         )
 
-        if not hasattr(self, "validation_table"):
+        # Use different table attributes for different prefixes
+        table_attr = f"{prefix.replace('/', '_')}_table"
+        
+        if not hasattr(self, table_attr):
             # Initialize the table on first call
-            self.validation_table = wandb.Table(columns=columns)
+            setattr(self, table_attr, wandb.Table(columns=columns))
 
         # Create a new table with same columns and existing data
         # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
-        new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+        existing_table = getattr(self, table_attr)
+        new_table = wandb.Table(columns=columns, data=existing_table.data)
 
         # Add new row with all data
         row_data = []
@@ -322,11 +326,11 @@ class ValidationGenerationsLogger:
 
         new_table.add_data(*row_data)
 
-        # Update reference and log
-        wandb.log({"val/generations": new_table}, step=step)
-        self.validation_table = new_table
+        # Update reference and log with custom prefix
+        wandb.log({prefix: new_table}, step=step)
+        setattr(self, table_attr, new_table)
 
-    def log_generations_to_swanlab(self, samples, step):
+    def log_generations_to_swanlab(self, samples, step, prefix="generations/val"):
         """Log samples to swanlab as text"""
         import swanlab
 
@@ -338,8 +342,8 @@ class ValidationGenerationsLogger:
         swanlab_row_list = [[step, *sample] for sample in samples]
         swanlab_table.add(headers=headers, rows=swanlab_row_list)
 
-        # Log to swanlab
-        swanlab.log({"val/generations": swanlab_table}, step=step)
+        # Log to swanlab with custom prefix
+        swanlab.log({prefix: swanlab_table}, step=step)
 
     def log_generations_to_mlflow(self, samples, step):
         """Log validation generation to mlflow as artifacts"""

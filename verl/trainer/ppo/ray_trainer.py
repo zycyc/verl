@@ -466,8 +466,6 @@ class RayPPOTrainer:
         if generations_to_log == 0:
             return
 
-        import numpy as np
-
         # Create tuples of (input, output, score) and sort by input text
         samples = list(zip(inputs, outputs, scores, strict=True))
         samples.sort(key=lambda x: x[0])  # Sort by input text
@@ -480,7 +478,7 @@ class RayPPOTrainer:
         samples = samples[:generations_to_log]
 
         # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps, prefix="generations/val")
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -1157,6 +1155,30 @@ class RayPPOTrainer:
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
                             )
+                    
+                    # Log training samples to WandB periodically
+                    log_train_generations = self.config.trainer.get("log_train_generations", 0)
+                    log_train_freq = self.config.trainer.get("log_train_freq", 100)
+                    
+                    if log_train_generations > 0 and self.global_steps % log_train_freq == 0:
+                        # Decode inputs and outputs for logging
+                        inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                        scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                        
+                        # Select samples to log
+                        num_samples = min(log_train_generations, len(inputs))
+                        
+                        # Just pick the top num_samples
+                        samples = list(zip(inputs, outputs, scores, strict=True))[:num_samples]
+                        
+                        # Log using the validation generations logger (which supports WandB)
+                        self.validation_generations_logger.log(
+                            self.config.trainer.logger, 
+                            samples, 
+                            self.global_steps,
+                            prefix="generations/train"  # Use different prefix for training samples
+                        )
 
                 # validate
                 if (

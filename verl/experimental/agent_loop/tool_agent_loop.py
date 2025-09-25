@@ -134,30 +134,22 @@ class ToolAgentLoop(AgentLoopBase):
             # reach max response length
             if len(response_mask) >= self.response_length:
                 decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                if "fitness tracker" in target_answer.lower():
-                    print(f"🤖 Reached max response length: {self.response_length}, stopping.\n➡️➡️➡️Full prompt: {decoded_prompt}.\nTarget answer: {target_answer}")
                 break
 
             # reach max assistant turns
             if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
                 decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                if "fitness tracker" in target_answer.lower():
-                    print(f"🤖 Reached max assistant turns: {self.max_assistant_turns}, stopping.\n➡️➡️➡️Full prompt: {decoded_prompt}.\nTarget answer: {target_answer}")
                 break
 
             # reach max user turns
             if self.max_user_turns and user_turns >= self.max_user_turns:
                 decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                if "fitness tracker" in target_answer.lower():
-                    print(f"🤖 Reached max user turns: {self.max_user_turns}, stopping.\n➡️➡️➡️Full prompt: {decoded_prompt}.\nTarget answer: {target_answer}")
                 break
 
             # no tool calls
             content, tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
             if not tool_calls:
                 decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                if "fitness tracker" in target_answer.lower():
-                    print(f"🤖 No tool calls found, stopping.\n➡️➡️➡️Full prompt: {decoded_prompt}.\nTarget answer: {target_answer}")
                 break
 
             # call tools
