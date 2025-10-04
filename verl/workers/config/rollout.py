@@ -54,6 +54,7 @@ class MultiTurnConfig(BaseConfig):
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
+    overlong_filter: bool = True  # Filter out trajectories that hit length/turn limits
 
 
 @dataclass

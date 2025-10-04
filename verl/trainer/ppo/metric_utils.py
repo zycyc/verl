@@ -222,11 +222,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
     # Memory performance metrics from memory_reward.py
-    if "performance_old" in batch.non_tensor_batch:
-        performance_old = batch.non_tensor_batch["performance_old"]
-        metrics["memory/performance_old/mean"] = performance_old.mean()
-        # metrics["memory/performance_old/max"] = performance_old.max()
-        # metrics["memory/performance_old/min"] = performance_old.min()
+    # if "performance_old" in batch.non_tensor_batch:
+    #     performance_old = batch.non_tensor_batch["performance_old"]
+    #     metrics["memory/performance_old/mean"] = performance_old.mean()
+    #     # metrics["memory/performance_old/max"] = performance_old.max()
+    #     # metrics["memory/performance_old/min"] = performance_old.min()
 
     if "performance_new" in batch.non_tensor_batch:
         performance_new = batch.non_tensor_batch["performance_new"]
@@ -674,20 +674,16 @@ def compute_data_metrics_by_category(batch: DataProto, use_critic: bool = True) 
         })
         
         # Add category-specific memory performance metrics
-        if "performance_old" in batch.non_tensor_batch and "performance_new" in batch.non_tensor_batch:
-            perf_old = batch.non_tensor_batch["performance_old"]
+        # if "performance_old" in batch.non_tensor_batch and "performance_new" in batch.non_tensor_batch:
+        if "performance_new" in batch.non_tensor_batch:
             perf_new = batch.non_tensor_batch["performance_new"]
             
-            cat_perf_old = perf_old[cat_mask]
             cat_perf_new = perf_new[cat_mask]
             
-            if len(cat_perf_old) > 0 and cat_non_aborted_mask.any():
-                cat_non_aborted_perf_old = cat_perf_old[cat_non_aborted_mask]
+            if len(cat_perf_new) > 0 and cat_non_aborted_mask.any():
                 cat_non_aborted_perf_new = cat_perf_new[cat_non_aborted_mask]
-                cat_perf_delta = cat_non_aborted_perf_new - cat_non_aborted_perf_old
                 
                 category_metrics.update({
-                    f"train-category/{cat_name}/memory/performance_old/mean": cat_non_aborted_perf_old.mean(),
                     f"train-category/{cat_name}/memory/performance_new/mean": cat_non_aborted_perf_new.mean(),
                     # f"train-category/{cat_name}/memory/performance_delta/mean": cat_perf_delta.mean(),
                     # f"train-category/{cat_name}/memory/performance_delta/positive_ratio": (cat_perf_delta > 0).astype(float).mean(),

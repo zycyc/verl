@@ -169,6 +169,9 @@ multi_turn:
 
   # Format of the multi-turn interaction. Options: hermes, llama3_json, ...
   format: hermes
+  
+  # Filter out trajectories that hit length/turn limits
+  overlong_filter: True
 
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling

@@ -47,6 +47,7 @@ class ToolAgentLoop(AgentLoopBase):
         cls.max_parallel_calls = config.actor_rollout_ref.rollout.multi_turn.max_parallel_calls
         cls.max_tool_response_length = config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         cls.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
+        cls.overlong_filter = config.actor_rollout_ref.rollout.multi_turn.overlong_filter
         tool_config_path = config.actor_rollout_ref.rollout.multi_turn.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         cls.tools = {tool.name: tool for tool in tool_list}
@@ -119,6 +120,7 @@ class ToolAgentLoop(AgentLoopBase):
                 print(f"⚠️ [AgentLoop] Failed to pre-initialize memory store: {e}")
 
         user_turns, assistant_turns = 0, 0
+        termination_reason = "COMPLETED"  # Default to completed
         while True:
             with simple_timer("generate_sequences", metrics):
                 output = await self.server_manager.generate(
@@ -134,22 +136,26 @@ class ToolAgentLoop(AgentLoopBase):
             # reach max response length
             if len(response_mask) >= self.response_length:
                 decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                termination_reason = "MAX_RESPONSE_LENGTH"
                 break
 
             # reach max assistant turns
             if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
                 decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                termination_reason = "MAX_ASSISTANT_TURNS"
                 break
 
             # reach max user turns
             if self.max_user_turns and user_turns >= self.max_user_turns:
                 decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                termination_reason = "MAX_USER_TURNS"
                 break
 
             # no tool calls
             content, tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
             if not tool_calls:
                 decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                termination_reason = "COMPLETED"  # Natural completion
                 break
 
             # call tools
@@ -229,6 +235,7 @@ class ToolAgentLoop(AgentLoopBase):
             # NOTE: last turn should not be user turn, or the EOS token reward
             # can't be propagated to previous token in GAE.
             if len(response_mask) + len(tool_response_ids) >= self.response_length:
+                termination_reason = "MAX_RESPONSE_LENGTH"
                 break
 
             prompt_ids += tool_response_ids
@@ -237,13 +244,24 @@ class ToolAgentLoop(AgentLoopBase):
                 response_logprobs += [0.0] * len(tool_response_ids)
             user_turns += 1
 
+        # Apply overlong_filter if enabled and trajectory was truncated
+        if self.overlong_filter and termination_reason in ["MAX_RESPONSE_LENGTH", "MAX_ASSISTANT_TURNS", "MAX_USER_TURNS"]:
+            # Mask out the entire response for overlong trajectories
+            response_mask = [0] * len(response_mask)
+            masked_overlong = True
+        else:
+            masked_overlong = False
+
         response_ids = prompt_ids[-len(response_mask) :]
         prompt_ids = prompt_ids[: len(prompt_ids) - len(response_mask)]
 
         multi_modal_data = {"image": image_data} if image_data is not None else {}
 
-        # 🔧 MEMUPDATE: Store trial_namespace in extra_fields for reward computation
-        extra_fields = {}
+        # 🔧 MEMUPDATE: Store trial_namespace and termination info in extra_fields
+        extra_fields = {
+            "termination_reason": termination_reason,
+            "masked_overlong": masked_overlong,
+        }
         if trial_namespace:
             extra_fields["trial_namespace"] = trial_namespace
 

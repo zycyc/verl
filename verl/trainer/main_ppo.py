@@ -322,21 +322,21 @@ class TaskRunner:
             print(f"First shard {k}: {v}")
         print(f"🏢 Initialized {num_shards} sharded MemoryBrokerActors!")
         
-        # Initialize all raw memory stores for all sample_ids
-        if "sample_ids" in conversation_stats:
-            sample_ids = conversation_stats["sample_ids"]
-            print(f"🏗️ Initializing raw memory stores for {len(sample_ids)} sample_ids...")
+        # Initialize all raw memory stores for all sample_ids (needed when we test performance_old)
+        # if "sample_ids" in conversation_stats:
+        #     sample_ids = conversation_stats["sample_ids"]
+        #     print(f"🏗️ Initializing raw memory stores for {len(sample_ids)} sample_ids...")
             
-            for sample_id in sample_ids:
-                try:
-                    MemoryStoreManager.init_conversation_memory(sample_id, sample_id)
-                    print(f"  ✅ Initialized raw store for {sample_id}")
-                except Exception as e:
-                    print(f"  ❌ Failed to initialize raw store for {sample_id}: {e}")
+        #     for sample_id in sample_ids:
+        #         try:
+        #             MemoryStoreManager.init_conversation_memory(sample_id, sample_id)
+        #             print(f"  ✅ Initialized raw store for {sample_id}")
+        #         except Exception as e:
+        #             print(f"  ❌ Failed to initialize raw store for {sample_id}: {e}")
             
-            print(f"🎯 Successfully initialized {len(sample_ids)} raw memory stores")
-        else:
-            print("⚠️ No sample_ids found in conversation_stats, skipping raw store initialization")
+        #     print(f"🎯 Successfully initialized {len(sample_ids)} raw memory stores")
+        # else:
+        #     print("⚠️ No sample_ids found in conversation_stats, skipping raw store initialization")
         
         # Initialize the workers of the trainer.
         trainer.init_workers()
