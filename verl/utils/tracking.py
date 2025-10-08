@@ -272,11 +272,11 @@ class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
 
-    def log(self, loggers, samples, step, prefix="generations/val"):
+    def log(self, loggers, samples, step, prefix="generations/val", categories=None, contexts=None, generated_answers=None):
         if "wandb" in loggers:
-            self.log_generations_to_wandb(samples, step, prefix)
+            self.log_generations_to_wandb(samples, step, prefix, categories, contexts, generated_answers)
         if "swanlab" in loggers:
-            self.log_generations_to_swanlab(samples, step, prefix)
+            self.log_generations_to_swanlab(samples, step, prefix, categories, contexts, generated_answers)
         if "mlflow" in loggers:
             self.log_generations_to_mlflow(samples, step, prefix)
 
@@ -286,24 +286,31 @@ class ValidationGenerationsLogger:
             self.log_generations_to_tensorboard(samples, step, prefix)
 
         if "vemlp_wandb" in loggers:
-            self.log_generations_to_vemlp_wandb(samples, step, prefix)
+            self.log_generations_to_vemlp_wandb(samples, step, prefix, categories, contexts, generated_answers)
 
-    def log_generations_to_vemlp_wandb(self, samples, step, prefix="generations/val"):
+    def log_generations_to_vemlp_wandb(self, samples, step, prefix="generations/val", categories=None, contexts=None, generated_answers=None):
         from volcengine_ml_platform import wandb as vemlp_wandb
 
-        self._log_generations_to_wandb(samples, step, vemlp_wandb, prefix)
+        self._log_generations_to_wandb(samples, step, vemlp_wandb, prefix, categories, contexts, generated_answers)
 
-    def log_generations_to_wandb(self, samples, step, prefix="generations/val"):
+    def log_generations_to_wandb(self, samples, step, prefix="generations/val", categories=None, contexts=None, generated_answers=None):
         import wandb
 
-        self._log_generations_to_wandb(samples, step, wandb, prefix)
+        self._log_generations_to_wandb(samples, step, wandb, prefix, categories, contexts, generated_answers)
 
-    def _log_generations_to_wandb(self, samples, step, wandb, prefix="generations/val"):
+    def _log_generations_to_wandb(self, samples, step, wandb, prefix="generations/val", categories=None, contexts=None, generated_answers=None):
         """Log samples to wandb as a table"""
 
-        # Create column names for all samples
+        # Create column names for all samples - include category and context if available
+        base_cols = ["input", "output", "score"]
+        if categories is not None:
+            base_cols.append("category")
+        if contexts is not None:
+            base_cols.append("context")
+        if generated_answers is not None:
+            base_cols.append("generated_answer")
         columns = ["step"] + sum(
-            [[f"input_{i + 1}", f"output_{i + 1}", f"score_{i + 1}"] for i in range(len(samples))], []
+            [[f"{col}_{i + 1}" for col in base_cols] for i in range(len(samples))], []
         )
 
         # Use different table attributes for different prefixes
@@ -321,25 +328,51 @@ class ValidationGenerationsLogger:
         # Add new row with all data
         row_data = []
         row_data.append(step)
-        for sample in samples:
+        for i, sample in enumerate(samples):
             row_data.extend(sample)
-
+            # Add category if available
+            if categories is not None and i < len(categories):
+                row_data.append(categories[i])
+            # Add context if available
+            if contexts is not None and i < len(contexts):
+                context = contexts[i] if contexts[i] else "N/A"
+                row_data.append(context)
+            if generated_answers is not None and i < len(generated_answers):
+                generated_answer = generated_answers[i] if generated_answers[i] else "N/A"
+                row_data.append(generated_answer)
         new_table.add_data(*row_data)
 
         # Update reference and log with custom prefix
         wandb.log({prefix: new_table}, step=step)
         setattr(self, table_attr, new_table)
 
-    def log_generations_to_swanlab(self, samples, step, prefix="generations/val"):
+    def log_generations_to_swanlab(self, samples, step, prefix="generations/val", categories=None, contexts=None, generated_answers=None):
         """Log samples to swanlab as text"""
         import swanlab
 
         swanlab_table = swanlab.echarts.Table()
 
-        # Create column names
+        # Create column names - include category and context if available
         headers = ["step", "input", "output", "score"]
-
-        swanlab_row_list = [[step, *sample] for sample in samples]
+        if categories is not None:
+            headers.append("category")
+        if contexts is not None:
+            headers.append("context")
+        if generated_answers is not None:
+            headers.append("generated_answer")
+        swanlab_row_list = []
+        for i, sample in enumerate(samples):
+            row = [step, *sample]
+            if categories is not None:
+                row.append(categories[i] if i < len(categories) else "unknown")
+            if contexts is not None:
+                context = contexts[i] if i < len(contexts) else "N/A"
+                row.append(context)
+            if generated_answers is not None and i < len(generated_answers):
+                generated_answer = generated_answers[i] if generated_answers[i] else "N/A"
+                row.append(generated_answer)
+            swanlab_row_list.append(row)
+            
         swanlab_table.add(headers=headers, rows=swanlab_row_list)
 
         # Log to swanlab with custom prefix

@@ -458,27 +458,28 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, categories=None, contexts=None, generated_answers=None):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
-
+        
         generations_to_log = self.config.trainer.log_val_generations
-
         if generations_to_log == 0:
             return
-
-        # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores, strict=True))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
-
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
-
-        # Take first N samples after shuffling
-        samples = samples[:generations_to_log]
-
+        
+        # Just take the first N samples directly
+        n = min(generations_to_log, len(inputs))
+        
+        samples = list(zip(inputs[:n], outputs[:n], scores[:n], strict=True))
+        
         # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps, prefix="generations/val")
+        self.validation_generations_logger.log(
+            self.config.trainer.logger, 
+            samples, 
+            self.global_steps, 
+            prefix="generations/val",
+            categories=categories[:n] if categories else None,
+            contexts=contexts[:n] if contexts else None,
+            generated_answers=generated_answers[:n] if generated_answers else None
+        )
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -507,6 +508,7 @@ class RayPPOTrainer:
         sample_gts = []
         sample_scores = []
         sample_turns = []
+        sample_contexts = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -588,7 +590,26 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        # Extract category information from reward_extra_infos_dict for logging
+        if "category" in reward_extra_infos_dict:
+            sample_categories = self._get_category_names(reward_extra_infos_dict["category"])
+        else:
+            sample_categories = None
+        
+        # Extract context information for logging
+        if "context" in reward_extra_infos_dict:
+            sample_contexts = reward_extra_infos_dict["context"]
+        if "generated_answer" in reward_extra_infos_dict:
+            sample_generated_answers = reward_extra_infos_dict["generated_answer"]
+        
+        self._maybe_log_val_generations(
+            inputs=sample_inputs, 
+            outputs=sample_outputs, 
+            scores=sample_scores, 
+            categories=sample_categories,
+            contexts=sample_contexts if sample_contexts else None,
+            generated_answers=sample_generated_answers if sample_generated_answers else None
+        )
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -739,6 +760,18 @@ class RayPPOTrainer:
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
+
+    def _get_category_names(self, category_numbers):
+        """Convert category numbers to human-readable names.
+        
+        Args:
+            category_numbers: List of category integers (1-4)
+            
+        Returns:
+            List of category name strings
+        """
+        category_mapping = {1: "multi_hop", 2: "temporal", 3: "open_domain", 4: "single_hop"}
+        return [category_mapping.get(cat, f"category_{cat}") for cat in category_numbers]
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1166,18 +1199,67 @@ class RayPPOTrainer:
                         outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                         scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
                         
+                        # Extract category information for logging
+                        train_categories = None
+                        if "category" in batch.non_tensor_batch:
+                            train_categories = self._get_category_names(batch.non_tensor_batch["category"])
+                        
+                        # Extract context information for logging
+                        train_contexts = None
+                        if "context" in batch.non_tensor_batch:
+                            train_contexts = batch.non_tensor_batch["context"].tolist() if hasattr(batch.non_tensor_batch["context"], "tolist") else list(batch.non_tensor_batch["context"])
+                        if "generated_answer" in batch.non_tensor_batch:
+                            train_generated_answers = batch.non_tensor_batch["generated_answer"].tolist() if hasattr(batch.non_tensor_batch["generated_answer"], "tolist") else list(batch.non_tensor_batch["generated_answer"])
+                        
                         # Select samples to log
                         num_samples = min(log_train_generations, len(inputs))
                         
                         # Just pick the top num_samples
                         samples = list(zip(inputs, outputs, scores, strict=True))[:num_samples]
                         
+                        # Safely slice categories with bounds checking
+                        selected_categories = None
+                        if train_categories:
+                            # Ensure we don't slice beyond available categories
+                            available_categories = min(num_samples, len(train_categories))
+                            selected_categories = train_categories[:available_categories]
+                            
+                            # Pad with "unknown" if we have fewer categories than samples
+                            if available_categories < num_samples:
+                                selected_categories.extend(["unknown"] * (num_samples - available_categories))
+                        
+                        # Safely slice contexts with bounds checking
+                        selected_contexts = None
+                        if train_contexts:
+                            # Ensure we don't slice beyond available contexts
+                            available_contexts = min(num_samples, len(train_contexts))
+                            selected_contexts = train_contexts[:available_contexts]
+                                    
+                            # Pad with empty string if we have fewer contexts than samples
+                            if available_contexts < num_samples:
+                                selected_contexts.extend(["N/A"] * (num_samples - available_contexts))
+
+                        # Safely slice generated answers with bounds checking
+                        selected_generated_answers = None
+                        if train_generated_answers:
+                            # Ensure we don't slice beyond available generated answers
+                            available_generated_answers = min(num_samples, len(train_generated_answers))
+                            selected_generated_answers = train_generated_answers[:available_generated_answers]
+                            
+                            # Pad with empty string if we have fewer generated answers than samples
+                            if available_generated_answers < num_samples:
+                                selected_generated_answers.extend(["N/A"] * (num_samples - available_generated_answers))
+
+                        
                         # Log using the validation generations logger (which supports WandB)
                         self.validation_generations_logger.log(
                             self.config.trainer.logger, 
                             samples, 
                             self.global_steps,
-                            prefix="generations/train"  # Use different prefix for training samples
+                            prefix="generations/train",  # Use different prefix for training samples
+                            categories=selected_categories,
+                            contexts=selected_contexts,
+                            generated_answers=selected_generated_answers
                         )
 
                 # validate

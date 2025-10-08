@@ -160,7 +160,8 @@ class ToolAgentLoop(AgentLoopBase):
 
             # call tools
             tasks = []
-            for tool_call in tool_calls[: self.max_parallel_calls]:
+            actual_tool_calls = tool_calls[: self.max_parallel_calls]
+            for tool_call in actual_tool_calls:
                 tasks.append(self._call_tool(tool_call, tools_kwargs))
             with simple_timer("tool_calls", metrics):
                 tool_responses = await asyncio.gather(*tasks)
@@ -170,6 +171,12 @@ class ToolAgentLoop(AgentLoopBase):
             # Extract messages and update multi_modal_data
             tool_messages = []
             new_images_this_turn = []
+            
+            # Calculate remaining turns info
+            remaining_assistant = f"turns remaining: {self.max_assistant_turns - assistant_turns}" if self.max_assistant_turns else ""
+            
+            status_info = f"\n[{remaining_assistant}]"
+            
             for tool_response in tool_responses:
                 # Create message from tool response
                 if tool_response.image or tool_response.video:
@@ -180,11 +187,13 @@ class ToolAgentLoop(AgentLoopBase):
                     if tool_response.video:
                         content.append({"type": "video"})
                     if tool_response.text:
-                        content.append({"type": "text", "text": tool_response.text})
+                        content.append({"type": "text", "text": (tool_response.text or "") + status_info})
+                    else:
+                        content.append({"type": "text", "text": status_info})
                     message = {"role": "tool", "content": content}
                 else:
                     # Text-only content
-                    message = {"role": "tool", "content": tool_response.text or ""}
+                    message = {"role": "tool", "content": (tool_response.text or "") + status_info}
 
                 tool_messages.append(message)
 
@@ -291,6 +300,8 @@ class ToolAgentLoop(AgentLoopBase):
             # 🔧 MEMUPDATE: Pass execute_kwargs instead of extra_info for trial_namespace
             tool_execution_response, _, _ = await tool.execute(instance_id, tool_args, **kwargs.get("execute_kwargs", {}))
         except Exception as e:
+            if tool_name.lower() == "done":
+                return ToolResponse(text="Error when executing tool: 'DONE', please return the string 'DONE' without any other text or formatting.")
             logger.warning(f"Error when executing tool: {e}")
             return ToolResponse(
                 text=f"Error when executing tool: {e}",
