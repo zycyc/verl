@@ -561,9 +561,12 @@ class RayPPOTrainer:
 
             print("validation generation end")
 
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            # Store generated outputs - use full_dialogue if available (for context clearing scenarios)
+            if "full_dialogue" in test_output_gen_batch.non_tensor_batch:
+                output_texts = list(test_output_gen_batch.non_tensor_batch["full_dialogue"])
+            else:
+                output_ids = test_output_gen_batch.batch["responses"]
+                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
@@ -1167,7 +1170,11 @@ class RayPPOTrainer:
                     if rollout_data_dir:
                         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                            # Use full_dialogue if available (for context clearing scenarios)
+                            if "full_dialogue" in batch.non_tensor_batch:
+                                outputs = list(batch.non_tensor_batch["full_dialogue"])
+                            else:
+                                outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
                             sample_gts = [
                                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
@@ -1196,7 +1203,11 @@ class RayPPOTrainer:
                     if log_train_generations > 0 and self.global_steps % log_train_freq == 0:
                         # Decode inputs and outputs for logging
                         inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                        outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                        # Use full_dialogue if available (for context clearing scenarios)
+                        if "full_dialogue" in batch.non_tensor_batch:
+                            outputs = list(batch.non_tensor_batch["full_dialogue"])
+                        else:
+                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                         scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
                         
                         # Extract category information for logging

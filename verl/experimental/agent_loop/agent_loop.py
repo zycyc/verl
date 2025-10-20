@@ -643,6 +643,13 @@ class AgentLoopWorker:
         for key in reward_extra_keys:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
+        # Add other extra_fields to non_tensor_batch
+        common_extra_keys = ["full_dialogue", "termination_reason", "masked_overlong",
+                             "context_clears_used", "num_segments", "trial_namespace"]
+        for key in common_extra_keys:
+            if key in inputs[0].extra_fields:
+                non_tensor_batch[key] = np.array([input.extra_fields.get(key) for input in inputs], dtype=object)
+
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
         if any(mmi is not None for mmi in multi_modal_inputs_list):

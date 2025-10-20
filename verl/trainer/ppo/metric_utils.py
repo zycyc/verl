@@ -135,11 +135,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
+    # Check if we have any valid tokens to compute metrics on
+    # This can be empty when all samples in batch are masked (e.g., after context clearing)
+    has_valid_tokens = valid_adv.numel() > 0
+
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
-        return_diff_var = torch.var(valid_returns - valid_values)
-        return_var = torch.var(valid_returns)
+        if has_valid_tokens:
+            return_diff_var = torch.var(valid_returns - valid_values)
+            return_var = torch.var(valid_returns)
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -166,21 +171,21 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
         # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        "critic/advantages/mean": torch.mean(valid_adv).detach().item() if has_valid_tokens else 0.0,
+        "critic/advantages/max": torch.max(valid_adv).detach().item() if has_valid_tokens else 0.0,
+        "critic/advantages/min": torch.min(valid_adv).detach().item() if has_valid_tokens else 0.0,
         # returns
-        "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
+        "critic/returns/mean": torch.mean(valid_returns).detach().item() if has_valid_tokens else 0.0,
+        "critic/returns/max": torch.max(valid_returns).detach().item() if has_valid_tokens else 0.0,
+        "critic/returns/min": torch.min(valid_returns).detach().item() if has_valid_tokens else 0.0,
         **(
             {
                 # values
-                "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
+                "critic/values/mean": torch.mean(valid_values).detach().item() if has_valid_tokens else 0.0,
+                "critic/values/max": torch.max(valid_values).detach().item() if has_valid_tokens else 0.0,
+                "critic/values/min": torch.min(valid_values).detach().item() if has_valid_tokens else 0.0,
                 # vf explained var
-                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item() if has_valid_tokens else 0.0,
             }
             if use_critic
             else {}
@@ -653,41 +658,39 @@ def compute_data_metrics_by_category(batch: DataProto, use_critic: bool = True) 
         
         if len(cat_scores) == 0:
             continue
-            
-        # Check for non-aborted samples in this category
+
+        # Add category-specific memory performance metrics FIRST
+        # Note: performance_new is computed by reward function for ALL samples (including aborted ones),
+        # so we compute this BEFORE checking for aborted samples
+        if "performance_new" in batch.non_tensor_batch:
+            perf_new = batch.non_tensor_batch["performance_new"]
+
+            cat_perf_new = perf_new[cat_mask]
+
+            if len(cat_perf_new) > 0:
+                # Use all samples in category, not just non-aborted ones
+                # Performance metrics exist even for aborted trajectories
+                category_metrics.update({
+                    f"train-category/{cat_name}/memory/performance_new/mean": cat_perf_new.mean(),
+                })
+
+        # Check for non-aborted samples in this category (for reward metrics)
         cat_response_lengths = cat_response_mask.sum(-1).float()
         cat_aborted_mask = (cat_response_lengths == 0).bool()
         cat_non_aborted_mask = ~cat_aborted_mask
-        
+
         if not cat_non_aborted_mask.any():
-            continue  # Skip if all samples in this category are aborted
-            
-        cat_non_aborted_scores = cat_scores[cat_non_aborted_mask]
+            continue  # Skip reward metrics if all samples in this category are aborted
+
         cat_non_aborted_rewards = cat_rewards[cat_non_aborted_mask]
-        
-        # Compute category-specific metrics (only mean rewards)
+
+        # Compute category-specific reward metrics (requires non-aborted samples)
         cat_reward_mean = torch.mean(cat_non_aborted_rewards).detach().item()
-        
-        # Store category metrics (only reward mean)
+
+        # Store category reward metrics
         category_metrics.update({
             f"train-category/{cat_name}/rewards/mean": cat_reward_mean,
         })
-        
-        # Add category-specific memory performance metrics
-        # if "performance_old" in batch.non_tensor_batch and "performance_new" in batch.non_tensor_batch:
-        if "performance_new" in batch.non_tensor_batch:
-            perf_new = batch.non_tensor_batch["performance_new"]
-            
-            cat_perf_new = perf_new[cat_mask]
-            
-            if len(cat_perf_new) > 0 and cat_non_aborted_mask.any():
-                cat_non_aborted_perf_new = cat_perf_new[cat_non_aborted_mask]
-                
-                category_metrics.update({
-                    f"train-category/{cat_name}/memory/performance_new/mean": cat_non_aborted_perf_new.mean(),
-                    # f"train-category/{cat_name}/memory/performance_delta/mean": cat_perf_delta.mean(),
-                    # f"train-category/{cat_name}/memory/performance_delta/positive_ratio": (cat_perf_delta > 0).astype(float).mean(),
-                })
     
     # Combine overall and category metrics
     combined_metrics = {**overall_metrics, **category_metrics}

@@ -48,6 +48,7 @@ class ToolAgentLoop(AgentLoopBase):
         cls.max_tool_response_length = config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         cls.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
         cls.overlong_filter = config.actor_rollout_ref.rollout.multi_turn.overlong_filter
+        cls.max_context_clears = config.actor_rollout_ref.rollout.multi_turn.get("max_context_clears", 3)
         tool_config_path = config.actor_rollout_ref.rollout.multi_turn.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         cls.tools = {tool.name: tool for tool in tool_list}
@@ -119,8 +120,21 @@ class ToolAgentLoop(AgentLoopBase):
             except Exception as e:
                 print(f"⚠️ [AgentLoop] Failed to pre-initialize memory store: {e}")
 
-        user_turns, assistant_turns = 0, 0
+        # Segment-local turn counters (reset on context clear)
+        segment_user_turns, segment_assistant_turns = 0, 0
+        # Cumulative turn counters (track across all segments)
+        total_user_turns, total_assistant_turns = 0, 0
         termination_reason = "COMPLETED"  # Default to completed
+
+        # Context clearing state
+        context_clears_remaining = self.max_context_clears
+        original_messages = copy.deepcopy(messages)  # Save original prompt
+        target_question = extra_info.get("target_question", "")
+
+        # Track full dialogue across context clears
+        dialogue_segments = []  # List of segment texts
+        current_segment_start_ids = list(prompt_ids)  # Save initial prompt for this segment
+
         while True:
             with simple_timer("generate_sequences", metrics):
                 output = await self.server_manager.generate(
@@ -131,51 +145,157 @@ class ToolAgentLoop(AgentLoopBase):
             response_mask += [1] * len(response_ids)
             if output.log_probs:
                 response_logprobs += output.log_probs
-            assistant_turns += 1
+            segment_assistant_turns += 1
+            total_assistant_turns += 1
 
             # reach max response length
             if len(response_mask) >= self.response_length:
-                decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                termination_reason = "MAX_RESPONSE_LENGTH"
-                break
+                if context_clears_remaining > 0:
+                    print(f"🔄 Context clearing triggered (MAX_RESPONSE_LENGTH). Clears remaining: {context_clears_remaining}")
+                    # Save current segment before clearing
+                    segment_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                    dialogue_segments.append(segment_text)
+
+                    context_clears_remaining -= 1
+                    prompt_ids, response_mask, response_logprobs = await self._clear_context_and_continue(
+                        original_messages, target_question, trial_namespace, image_data,
+                        why="reaching max response length", msg=""
+                    )
+
+                    # Reset segment counters (totals already accumulated)
+                    segment_user_turns = 0
+                    segment_assistant_turns = 0
+                    current_segment_start_ids = list(prompt_ids)
+                    continue
+                else:
+                    decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                    termination_reason = "MAX_RESPONSE_LENGTH"
+                    break
 
             # reach max assistant turns
-            if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
-                decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                termination_reason = "MAX_ASSISTANT_TURNS"
-                break
+            if self.max_assistant_turns and segment_assistant_turns >= self.max_assistant_turns:
+                if context_clears_remaining > 0:
+                    print(f"🔄 Context clearing triggered (MAX_ASSISTANT_TURNS). Clears remaining: {context_clears_remaining}")
+                    # Save current segment before clearing
+                    segment_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                    dialogue_segments.append(segment_text)
+
+                    context_clears_remaining -= 1
+                    prompt_ids, response_mask, response_logprobs = await self._clear_context_and_continue(
+                        original_messages, target_question, trial_namespace, image_data,
+                        why="reaching max assistant turns", msg=""
+                    )
+
+                    # Reset segment counters (totals already accumulated)
+                    segment_user_turns = 0
+                    segment_assistant_turns = 0
+                    current_segment_start_ids = list(prompt_ids)
+                    continue
+                else:
+                    decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                    termination_reason = "MAX_ASSISTANT_TURNS"
+                    break
 
             # reach max user turns
-            if self.max_user_turns and user_turns >= self.max_user_turns:
-                decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                termination_reason = "MAX_USER_TURNS"
-                break
+            if self.max_user_turns and segment_user_turns >= self.max_user_turns:
+                if context_clears_remaining > 0:
+                    print(f"🔄 Context clearing triggered (MAX_USER_TURNS). Clears remaining: {context_clears_remaining}")
+                    # Save current segment before clearing
+                    segment_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                    dialogue_segments.append(segment_text)
+
+                    context_clears_remaining -= 1
+                    prompt_ids, response_mask, response_logprobs = await self._clear_context_and_continue(
+                        original_messages, target_question, trial_namespace, image_data,
+                        why="reaching max user turns", msg=""
+                    )
+
+                    # Reset segment counters (totals already accumulated)
+                    segment_user_turns = 0
+                    segment_assistant_turns = 0
+                    current_segment_start_ids = list(prompt_ids)
+                    continue
+                else:
+                    decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                    termination_reason = "MAX_USER_TURNS"
+                    break
 
             # no tool calls
             content, tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
             if not tool_calls:
-                decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                termination_reason = "COMPLETED"  # Natural completion
-                break
+                decoded_response = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                if decoded_response.strip().upper() == "DONE":
+                    termination_reason = "COMPLETED"  # Natural completion
+                    break
+                else:
+                    termination_reason = "NOT_DONE"
+                    tool_responses = []  # Initialize empty list to avoid NameError later
 
             # call tools
-            tasks = []
-            actual_tool_calls = tool_calls[: self.max_parallel_calls]
-            for tool_call in actual_tool_calls:
-                tasks.append(self._call_tool(tool_call, tools_kwargs))
-            with simple_timer("tool_calls", metrics):
-                tool_responses = await asyncio.gather(*tasks)
-            if any(isinstance(item, Exception) for item in tool_responses):
-                break
+            if tool_calls:
+                # Update execute_kwargs with current context_clears_remaining
+                if tools_kwargs:
+                    for _, tool_config in tools_kwargs.items():
+                        tool_config["execute_kwargs"]["context_clears_remaining"] = context_clears_remaining
+
+                tasks = []
+                actual_tool_calls = tool_calls[: self.max_parallel_calls]
+                for tool_call in actual_tool_calls:
+                    tasks.append(self._call_tool(tool_call, tools_kwargs))
+                with simple_timer("tool_calls", metrics):
+                    tool_responses = await asyncio.gather(*tasks)
+                if any(isinstance(item, Exception) for item in tool_responses):
+                    break
+
+                # Check for context clearing marker in tool responses
+                for tool_response in tool_responses:
+                    if tool_response.text and tool_response.text.startswith("__CLEAR_CONTEXT__"):
+                        if context_clears_remaining > 0:
+                            # Parse the message from the marker: __CLEAR_CONTEXT__{reasoning}|||{message}
+                            marker_content = tool_response.text.replace("__CLEAR_CONTEXT__", "", 1)
+                            if "|||" in marker_content:
+                                _, agent_message = marker_content.split("|||", 1)
+                            else:
+                                agent_message = ""
+
+                            print(f"🔄 Context clearing triggered (SPONTANEOUS TOOL CALL). Clears remaining: {context_clears_remaining}")
+                            # Save current segment before clearing
+                            segment_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                            dialogue_segments.append(segment_text)
+
+                            context_clears_remaining -= 1
+                            prompt_ids, response_mask, response_logprobs = await self._clear_context_and_continue(
+                                original_messages, target_question, trial_namespace, image_data,
+                                why="spontaneous tool call", msg=agent_message
+                            )
+
+                            # Reset segment counters (totals already accumulated)
+                            segment_user_turns = 0
+                            segment_assistant_turns = 0
+                            current_segment_start_ids = list(prompt_ids)
+                            # Skip the rest of the loop and start fresh
+                            # Set a flag to skip appending tool responses
+                            break
+                        else:
+                            # This shouldn't happen since ClearContextTool checks this
+                            # But handle it gracefully anyway
+                            print(f"⚠️ Context clearing requested but no clears remaining")
+
+                # If context was cleared, continue to next iteration
+                if any(r.text and r.text.startswith("__CLEAR_CONTEXT__") for r in tool_responses if r.text):
+                    continue
 
             # Extract messages and update multi_modal_data
             tool_messages = []
             new_images_this_turn = []
             
             # Calculate remaining turns info
-            remaining_assistant = f"turns remaining: {self.max_assistant_turns - assistant_turns}" if self.max_assistant_turns else ""
-            
+            remaining_assistant = f"turns remaining: {self.max_assistant_turns - segment_assistant_turns}" if self.max_assistant_turns else ""
+
             status_info = f"\n[{remaining_assistant}]"
+            
+            if not tool_calls and termination_reason == "NOT_DONE":
+                tool_messages.append({"role": "tool", "content": "No tool calls detected. Either fix the previous response in a correct format or return the string 'DONE' without any other text or formatting to finish the task." + status_info})
             
             for tool_response in tool_responses:
                 # Create message from tool response
@@ -244,14 +364,32 @@ class ToolAgentLoop(AgentLoopBase):
             # NOTE: last turn should not be user turn, or the EOS token reward
             # can't be propagated to previous token in GAE.
             if len(response_mask) + len(tool_response_ids) >= self.response_length:
-                termination_reason = "MAX_RESPONSE_LENGTH"
-                break
+                if context_clears_remaining > 0:
+                    print(f"🔄 Context clearing triggered (TOOL_RESPONSE_OVERFLOW). Clears remaining: {context_clears_remaining}")
+                    # Save current segment before clearing
+                    segment_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                    dialogue_segments.append(segment_text)
 
+                    context_clears_remaining -= 1
+                    prompt_ids, response_mask, response_logprobs = await self._clear_context_and_continue(
+                        original_messages, target_question, trial_namespace, image_data,
+                        why="tool response overflowing the context window", msg=""
+                    )
+
+                    # Reset segment counters (totals already accumulated)
+                    segment_user_turns = 0
+                    segment_assistant_turns = 0
+                    current_segment_start_ids = list(prompt_ids)
+                    continue  # Try again with cleared context
+                else:
+                    termination_reason = "MAX_RESPONSE_LENGTH"
+                    break
             prompt_ids += tool_response_ids
             response_mask += [0] * len(tool_response_ids)
             if response_logprobs:
                 response_logprobs += [0.0] * len(tool_response_ids)
-            user_turns += 1
+            segment_user_turns += 1
+            total_user_turns += 1
 
         # Apply overlong_filter if enabled and trajectory was truncated
         if self.overlong_filter and termination_reason in ["MAX_RESPONSE_LENGTH", "MAX_ASSISTANT_TURNS", "MAX_USER_TURNS"]:
@@ -261,15 +399,29 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             masked_overlong = False
 
+        # Save the final segment
+        final_segment_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+        dialogue_segments.append(final_segment_text)
+
+        # Reconstruct full dialogue across all segments
+        if len(dialogue_segments) > 1:
+            full_dialogue = "\n\n=== CONTEXT CLEARED ===\n\n".join(dialogue_segments)
+        else:
+            full_dialogue = dialogue_segments[0] if dialogue_segments else ""
+
         response_ids = prompt_ids[-len(response_mask) :]
+        print(f"DEBUG: termination={termination_reason}, response_mask_len={len(response_mask)}, context_clears_used={self.max_context_clears - context_clears_remaining}, num_segments={len(dialogue_segments)}, total_turns={total_user_turns + total_assistant_turns}")
         prompt_ids = prompt_ids[: len(prompt_ids) - len(response_mask)]
 
         multi_modal_data = {"image": image_data} if image_data is not None else {}
 
-        # 🔧 MEMUPDATE: Store trial_namespace and termination info in extra_fields
+        # 🔧 MEMUPDATE: Store trial_namespace, termination info, and full dialogue in extra_fields
         extra_fields = {
             "termination_reason": termination_reason,
             "masked_overlong": masked_overlong,
+            "context_clears_used": self.max_context_clears - context_clears_remaining,
+            "full_dialogue": full_dialogue,
+            "num_segments": len(dialogue_segments),
         }
         if trial_namespace:
             extra_fields["trial_namespace"] = trial_namespace
@@ -280,11 +432,97 @@ class ToolAgentLoop(AgentLoopBase):
             response_mask=response_mask[: self.response_length],
             multi_modal_data=multi_modal_data,
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
-            num_turns=user_turns + assistant_turns + 1,
+            num_turns=total_user_turns + total_assistant_turns + 1,  # Use total turns across all segments
             metrics=metrics,
             extra_fields=extra_fields,
         )
         return output
+
+    async def _clear_context_and_continue(
+        self,
+        original_messages: list,
+        target_question: str,
+        trial_namespace: str,
+        image_data: Any,
+        why: str = "Unknown reason",
+        msg: str = ""
+    ) -> tuple[list, list, list]:
+        """
+        Clear context and reconstruct prompt with memory summary.
+
+        Returns:
+            prompt_ids: New tokenized prompt
+            response_mask: Reset mask
+            response_logprobs: Reset logprobs
+        """
+        # 1. Retrieve all agent-generated memories
+        from memupdate.tools.base_memory_tool import MemoryStoreManager
+
+        result = await MemoryStoreManager.search_memory_via_actor_async(
+            trial_namespace=trial_namespace,
+            query="",
+            limit=None,
+            source_filter="agent_output",
+            list_all=True,
+            search_type="semantic_search"
+        )
+
+        # 2. Format memories into summary
+        memory_summary = f"Context clearing triggered by {why}\n"
+        agent_memories = result.get("results", [])
+        if agent_memories:
+            memory_summary += "Here are the memories you have created so far:\n"
+            for i, mem in enumerate(agent_memories, 1):
+                content = mem.get("content", "")
+                memory_summary += f"{i}. {content}\n"
+        else:
+            memory_summary += "You haven't created any memories yet.\n"
+
+        # 3. Create continuation message
+        continuation_content = memory_summary
+        if msg:
+            continuation_content += f"\n{msg}\n"
+        continuation_content += f"\nContinue working on answering the question: {target_question}\n\nUse available tools to refine and improve the memories. Say 'DONE' when you're satisfied with the memory organization."
+
+        continuation_message = {
+            "role": "user",
+            "content": continuation_content
+        }
+
+        # 4. Reconstruct messages
+        new_messages = original_messages + [continuation_message]
+
+        # 5. Re-tokenize
+        if self.processor is not None:
+            raw_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: self.processor.apply_chat_template(
+                    new_messages,
+                    tools=self.tool_schemas,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+            model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
+            new_prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+        else:
+            new_prompt_ids = await self.loop.run_in_executor(
+                None,
+                lambda: self.tokenizer.apply_chat_template(
+                    new_messages,
+                    tools=self.tool_schemas,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+
+        # 6. Reset tracking variables
+        new_response_mask = []
+        new_response_logprobs = []
+
+        return new_prompt_ids, new_response_mask, new_response_logprobs
 
     async def _call_tool(self, tool_call: FunctionCall, tools_kwargs: dict[str, Any]) -> ToolResponse:
         """Call tool and return tool response."""
