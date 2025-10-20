@@ -121,16 +121,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     aborted_mask = (response_length == 0).bool()
     non_aborted_mask = ~aborted_mask
 
-    non_aborted_sequence_score = sequence_score[non_aborted_mask]
-    non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
+    # Include ALL samples in metrics - aborted samples contribute 0 to scores/rewards
+    score_mean = torch.mean(sequence_score).detach().item()
+    score_max = torch.max(sequence_score).detach().item()
+    score_min = torch.min(sequence_score).detach().item()
 
-    score_mean = torch.mean(non_aborted_sequence_score).detach().item()
-    score_max = torch.max(non_aborted_sequence_score).detach().item()
-    score_min = torch.min(non_aborted_sequence_score).detach().item()
-
-    reward_mean = torch.mean(non_aborted_sequence_reward).detach().item()
-    reward_max = torch.max(non_aborted_sequence_reward).detach().item()
-    reward_min = torch.min(non_aborted_sequence_reward).detach().item()
+    reward_mean = torch.mean(sequence_reward).detach().item()
+    reward_max = torch.max(sequence_reward).detach().item()
+    reward_min = torch.min(sequence_reward).detach().item()
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -654,19 +652,11 @@ def compute_data_metrics_by_category(batch: DataProto, use_critic: bool = True) 
         if len(cat_scores) == 0:
             continue
             
-        # Check for non-aborted samples in this category
-        cat_response_lengths = cat_response_mask.sum(-1).float()
-        cat_aborted_mask = (cat_response_lengths == 0).bool()
-        cat_non_aborted_mask = ~cat_aborted_mask
-        
-        if not cat_non_aborted_mask.any():
-            continue  # Skip if all samples in this category are aborted
-            
-        cat_non_aborted_scores = cat_scores[cat_non_aborted_mask]
-        cat_non_aborted_rewards = cat_rewards[cat_non_aborted_mask]
+        # Include ALL samples in category metrics - aborted samples contribute 0
+        # No filtering needed since aborted samples already have 0 rewards/scores
         
         # Compute category-specific metrics (only mean rewards)
-        cat_reward_mean = torch.mean(cat_non_aborted_rewards).detach().item()
+        cat_reward_mean = torch.mean(cat_rewards).detach().item()
         
         # Store category metrics (only reward mean)
         category_metrics.update({
@@ -680,11 +670,10 @@ def compute_data_metrics_by_category(batch: DataProto, use_critic: bool = True) 
             
             cat_perf_new = perf_new[cat_mask]
             
-            if len(cat_perf_new) > 0 and cat_non_aborted_mask.any():
-                cat_non_aborted_perf_new = cat_perf_new[cat_non_aborted_mask]
-                
+            if len(cat_perf_new) > 0:
+                # Include ALL samples - aborted samples should have 0 performance
                 category_metrics.update({
-                    f"train-category/{cat_name}/memory/performance_new/mean": cat_non_aborted_perf_new.mean(),
+                    f"train-category/{cat_name}/memory/performance_new/mean": cat_perf_new.mean(),
                     # f"train-category/{cat_name}/memory/performance_delta/mean": cat_perf_delta.mean(),
                     # f"train-category/{cat_name}/memory/performance_delta/positive_ratio": (cat_perf_delta > 0).astype(float).mean(),
                 })
