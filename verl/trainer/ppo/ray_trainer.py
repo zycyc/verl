@@ -522,11 +522,9 @@ class RayPPOTrainer:
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
+            # Store original inputs (will be replaced with actual prompts after generation)
+            # input_ids = test_batch.batch["input_ids"]
+            # Note: Actual prompt with tools and RAG context will be captured after generation
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -560,6 +558,11 @@ class RayPPOTrainer:
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             print("validation generation end")
+
+            # Store actual prompts with tools and RAG context (from agent loop output)
+            actual_prompt_ids = test_output_gen_batch.batch["prompts"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in actual_prompt_ids]
+            sample_inputs.extend(input_texts)
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]

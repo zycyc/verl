@@ -54,6 +54,9 @@ class ToolAgentLoop(AgentLoopBase):
         cls.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
         print(f"Initialized tools: {cls.tools}")
+        
+        # Load speaker mapping for RAG context
+        cls._speaker_mapping = cls._load_speaker_mapping()
 
         cls.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
         cls.prompt_length = config.actor_rollout_ref.rollout.prompt_length
@@ -61,6 +64,188 @@ class ToolAgentLoop(AgentLoopBase):
         cls.system_prompt = tokenizer.apply_chat_template(
             [{}], add_generation_prompt=False, tokenize=True, **cls.apply_chat_template_kwargs
         )
+
+    @classmethod
+    def _load_speaker_mapping(cls) -> dict:
+        """Load speaker mapping from locomo10.json."""
+        import json
+        import os
+
+        try:
+            locomo_path = "/workspace/memupdate/data/locomo10.json"
+            if not os.path.exists(locomo_path):
+                print(f"⚠️ LoCoMo data not found at {locomo_path}, RAG context will be disabled")
+                return {}
+
+            with open(locomo_path, 'r') as f:
+                locomo_data = json.load(f)
+
+            speaker_mapping = {}
+            for conv in locomo_data:
+                sample_id = conv.get("sample_id", "")
+                if sample_id and "conversation" in conv:
+                    speaker_a = conv["conversation"].get("speaker_a", "")
+                    speaker_b = conv["conversation"].get("speaker_b", "")
+                    if speaker_a and speaker_b:
+                        speaker_mapping[sample_id] = (speaker_a, speaker_b)
+
+            print(f"✅ Loaded speaker mapping for {len(speaker_mapping)} conversations")
+            return speaker_mapping
+
+        except Exception as e:
+            print(f"⚠️ Failed to load speaker mapping: {e}")
+            return {}
+
+    def _group_memories_by_context(self, memories: list[dict]) -> list[dict]:
+        """Group memories by their context relationships for chunked formatting."""
+        # First, identify all search results and create groups for them
+        memory_groups = []
+        result_memories = [m for m in memories if not m.get("is_context", False) or m.get("position") == "search_result"]
+        
+        # If no explicit results found (all are context or no position set), treat all non-context as results
+        if not result_memories:
+            result_memories = [m for m in memories if not m.get("is_context", False)]
+        
+        # Create a group for each search result with its associated context
+        for result_mem in result_memories:
+            result_id = result_mem.get("id")
+            
+            # Find all context memories that belong to this result using context_for field
+            group = {
+                "previous": [m for m in memories 
+                            if m.get("is_context", False) and 
+                               m.get("position") == "previous" and 
+                               m.get("context_for") == result_id],
+                "result": result_mem,
+                "next": [m for m in memories 
+                        if m.get("is_context", False) and 
+                           m.get("position") == "next" and 
+                           m.get("context_for") == result_id]
+            }
+            memory_groups.append(group)
+        
+        return memory_groups
+
+    def _format_memory_metadata(self, metadata: dict) -> str:
+        """Format metadata for consistent display in memory formatting."""
+        metadata_parts = []
+        if metadata.get("speaker"):
+            metadata_parts.append(f"Speaker: {metadata['speaker']}")
+        if metadata.get("source"):
+            metadata_parts.append(f"Source: {metadata['source']}")
+        if metadata.get("evidence"):
+            metadata_parts.append(f"Evidence: {metadata['evidence']}")
+        if metadata.get("session"):
+            metadata_parts.append(f"Session: {metadata['session']}")
+        if metadata.get("timestamp"):
+            metadata_parts.append(f"Time: {metadata['timestamp']}")
+        return f" [{' | '.join(metadata_parts)}]" if metadata_parts else ""
+
+    async def _retrieve_initial_context(self, target_question: str, sample_id: str, trial_namespace: str) -> str:
+        """Retrieve initial RAG context from conversation memories for both speakers."""
+        try:
+            # Look up speakers for this sample
+            speakers = self._speaker_mapping.get(sample_id, (None, None))
+            speaker_a, speaker_b = speakers
+
+            if not speaker_a or not speaker_b:
+                return ""
+            
+            from memupdate.tools.base_memory_tool import MemoryStoreManager
+            
+            # Run parallel queries for both speakers
+            tasks = []
+            if speaker_a:
+                tasks.append(MemoryStoreManager.search_memory_via_actor_async(
+                    trial_namespace=trial_namespace,
+                    query=target_question,
+                    limit=5,
+                    source_filter="conversation",
+                    speaker_filter=speaker_a,
+                    search_type="semantic_search",
+                    n_prev=2,
+                    n_next=2
+                ))
+            if speaker_b:
+                tasks.append(MemoryStoreManager.search_memory_via_actor_async(
+                    trial_namespace=trial_namespace,
+                    query=target_question,
+                    limit=5,
+                    source_filter="conversation", 
+                    speaker_filter=speaker_b,
+                    search_type="semantic_search",
+                    n_prev=2,
+                    n_next=2
+                ))
+            
+            if not tasks:
+                return ""
+                
+            # Execute queries in parallel
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Build rich context string with memory groups and metadata
+            formatted_sections = []
+            memory_counter = 1
+            
+            # Process results for both speakers
+            speakers_data = [
+                (speaker_a, results[0] if len(results) > 0 and not isinstance(results[0], Exception) else None),
+                (speaker_b, results[1] if len(results) > 1 and not isinstance(results[1], Exception) else None)
+            ]
+            
+            for speaker, speaker_results in speakers_data:
+                if not speaker or not speaker_results:
+                    continue
+                    
+                if speaker_results.get("success") and speaker_results.get("results"):
+                    memories = speaker_results["results"]
+                    if not memories:
+                        continue
+                    
+                    # Add section header with rich formatting
+                    section_header = f"\n{'='*60}\nConversation Memories - {speaker} ({len(memories)} memories)\n{'='*60}"
+                    section_lines = [section_header]
+                    
+                    # Group memories by context relationships
+                    memory_groups = self._group_memories_by_context(memories)
+                    
+                    for group_idx, group in enumerate(memory_groups):
+                        if group_idx > 0:
+                            section_lines.append("")  # Blank line between groups within section
+                        
+                        # Add memory group header
+                        section_lines.append(f"--- Memory Group {group_idx + 1} ---")
+                        
+                        # Format previous context
+                        for prev_mem in group["previous"]:
+                            metadata_str = self._format_memory_metadata(prev_mem.get("metadata", {}))
+                            section_lines.append(f"Memory {memory_counter} [CONTEXT]{metadata_str}: {prev_mem.get('content', '')}")
+                            memory_counter += 1
+                        
+                        # Format main result
+                        if group["result"]:
+                            result_mem = group["result"]
+                            metadata_str = self._format_memory_metadata(result_mem.get("metadata", {}))
+                            section_lines.append(f"Memory {memory_counter}{metadata_str}: {result_mem.get('content', '')}")
+                            memory_counter += 1
+                        
+                        # Format next context
+                        for next_mem in group["next"]:
+                            metadata_str = self._format_memory_metadata(next_mem.get("metadata", {}))
+                            section_lines.append(f"Memory {memory_counter} [CONTEXT]{metadata_str}: {next_mem.get('content', '')}")
+                            memory_counter += 1
+                    
+                    formatted_sections.append("\n".join(section_lines))
+            
+            if formatted_sections:
+                return "\n".join(formatted_sections)
+            else:
+                return ""
+                
+        except Exception as e:
+            print(f"⚠️ Failed to retrieve initial context: {e}")
+            return ""
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -118,9 +303,48 @@ class ToolAgentLoop(AgentLoopBase):
                 MemoryStoreManager.init_conversation_memory(trial_namespace, sample_id)
             except Exception as e:
                 print(f"⚠️ [AgentLoop] Failed to pre-initialize memory store: {e}")
+        
+        # 🔧 MEMUPDATE: Retrieve initial RAG context and add to messages
+        target_question = extra_info.get("target_question", "")
+        if trial_namespace and sample_id and target_question:
+            initial_context = await self._retrieve_initial_context(target_question, sample_id, trial_namespace)
+            if initial_context:
+                # Add context as a user message
+                context_message = {
+                    "role": "user", 
+                    "content": f"Here is some relevant context from the conversation database that may help answer the question:\n\n{initial_context}\n\nNow, please search for more specific information and submit your final answer using the submit_answer tool."
+                }
+                messages.append(context_message)
+                
+                # Regenerate prompt_ids with the updated messages
+                if self.processor is not None:
+                    raw_prompt = await self.loop.run_in_executor(
+                        None,
+                        lambda: self.processor.apply_chat_template(
+                            messages,
+                            tools=self.tool_schemas,
+                            add_generation_prompt=True,
+                            tokenize=False,
+                            **self.apply_chat_template_kwargs,
+                        ),
+                    )
+                    model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
+                    prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+                else:
+                    prompt_ids = await self.loop.run_in_executor(
+                        None,
+                        lambda: self.tokenizer.apply_chat_template(
+                            messages,
+                            tools=self.tool_schemas,
+                            add_generation_prompt=True,
+                            tokenize=True,
+                            **self.apply_chat_template_kwargs,
+                        ),
+                    )
 
         user_turns, assistant_turns = 0, 0
         termination_reason = "COMPLETED"  # Default to completed
+        answer_submitted = False  # Track if submit_answer was called
         while True:
             with simple_timer("generate_sequences", metrics):
                 output = await self.server_manager.generate(
@@ -165,6 +389,13 @@ class ToolAgentLoop(AgentLoopBase):
                 tasks.append(self._call_tool(tool_call, tools_kwargs))
             with simple_timer("tool_calls", metrics):
                 tool_responses = await asyncio.gather(*tasks)
+            
+            # Check if submit_answer was called
+            for tool_call in actual_tool_calls:
+                if hasattr(tool_call, 'name') and tool_call.name == 'submit_answer':
+                    answer_submitted = True
+                    termination_reason = "ANSWER_SUBMITTED"
+            
             if any(isinstance(item, Exception) for item in tool_responses):
                 break
 
@@ -252,6 +483,10 @@ class ToolAgentLoop(AgentLoopBase):
             if response_logprobs:
                 response_logprobs += [0.0] * len(tool_response_ids)
             user_turns += 1
+            
+            # Break if answer was submitted
+            if answer_submitted:
+                break
 
         # Apply overlong_filter if enabled and trajectory was truncated
         if self.overlong_filter and termination_reason in ["MAX_RESPONSE_LENGTH", "MAX_ASSISTANT_TURNS", "MAX_USER_TURNS"]:
