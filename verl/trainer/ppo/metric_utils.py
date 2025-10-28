@@ -220,17 +220,23 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
     # Memory performance metrics from memory_reward.py
-    # if "performance_old" in batch.non_tensor_batch:
-    #     performance_old = batch.non_tensor_batch["performance_old"]
-    #     metrics["memory/performance_old/mean"] = performance_old.mean()
-    #     # metrics["memory/performance_old/max"] = performance_old.max()
-    #     # metrics["memory/performance_old/min"] = performance_old.min()
-
+    # Legacy metric for backward compatibility
     if "performance_new" in batch.non_tensor_batch:
         performance_new = batch.non_tensor_batch["performance_new"]
         metrics["memory/performance_new/mean"] = performance_new.mean()
-        # metrics["memory/performance_new/max"] = performance_new.max()
-        # metrics["memory/performance_new/min"] = performance_new.min()
+    
+    # New metrics: J (Judge), F1, B1 (BLEU-1)
+    if "J" in batch.non_tensor_batch:
+        j_scores = batch.non_tensor_batch["J"]
+        metrics["memory/J/mean"] = j_scores.mean()
+    
+    if "F1" in batch.non_tensor_batch:
+        f1_scores = batch.non_tensor_batch["F1"]
+        metrics["memory/F1/mean"] = f1_scores.mean()
+    
+    if "B1" in batch.non_tensor_batch:
+        b1_scores = batch.non_tensor_batch["B1"]
+        metrics["memory/B1/mean"] = b1_scores.mean()
 
     return metrics
 
@@ -527,7 +533,7 @@ def process_validation_metrics_by_category(
             }
         }
 
-        Where category_name is like "single_hop", "multi_hop", etc.
+        Where category_name is like "single_hop", "multi_hop", "overall", etc.
     """
     # Extract category information from extra_info if available
     categories = []
@@ -541,15 +547,24 @@ def process_validation_metrics_by_category(
     
     # Group metrics by category, prompt and variable
     cat2prompt2var2vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    
+    # Collect for overall metrics (all categories combined)
+    overall_prompt2var2vals = defaultdict(lambda: defaultdict(list))
+    
     for sample_idx, category in enumerate(categories):
         prompt = sample_inputs[sample_idx]
         var2vals = cat2prompt2var2vals[category][prompt]
+        overall_var2vals = overall_prompt2var2vals[prompt]
+        
         for var_name, var_vals in infos_dict.items():
             if var_name != "category":  # Skip category itself
                 var2vals[var_name].append(var_vals[sample_idx])
+                overall_var2vals[var_name].append(var_vals[sample_idx])
 
-    # Calculate metrics for each group
+    # Calculate metrics for each category group and overall
     cat2prompt2var2metric = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+    
+    # Process per-category metrics
     for category, prompt2var2vals in cat2prompt2var2vals.items():
         for prompt, var2vals in prompt2var2vals.items():
             for var_name, var_vals in var2vals.items():
@@ -589,6 +604,46 @@ def process_validation_metrics_by_category(
                             metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
 
                 cat2prompt2var2metric[category][prompt][var_name] = metric
+    
+    # Process overall metrics (all categories combined)
+    for prompt, var2vals in overall_prompt2var2vals.items():
+        for var_name, var_vals in var2vals.items():
+            if isinstance(var_vals[0], str):
+                continue
+
+            metric = {}
+            n_resps = len(var_vals)
+            metric[f"mean@{n_resps}"] = np.mean(var_vals)
+
+            if n_resps > 1:
+                metric[f"std@{n_resps}"] = np.std(var_vals)
+
+                ns = []
+                n = 2
+                while n < n_resps:
+                    ns.append(n)
+                    n *= 2
+                ns.append(n_resps)
+
+                for n in ns:
+                    [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
+                        data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
+                    )
+                    metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
+                    metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
+                    if overall_prompt2var2vals[prompt].get("pred", None) is not None:
+                        vote_data = [
+                            {"val": val, "pred": pred} for val, pred in zip(var_vals, overall_prompt2var2vals[prompt]["pred"], strict=True)
+                        ]
+                        [(maj_n_mean, maj_n_std)] = bootstrap_metric(
+                            data=vote_data,
+                            subset_size=n,
+                            reduce_fns=[partial(calc_maj_val, vote_key="pred", val_key="val")],
+                            seed=seed,
+                        )
+                        metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+
+            cat2prompt2var2metric["overall"][prompt][var_name] = metric
 
     # Aggregate metrics across prompts
     cat2var2metric2prompt_vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -664,19 +719,34 @@ def compute_data_metrics_by_category(batch: DataProto, use_critic: bool = True) 
         })
         
         # Add category-specific memory performance metrics
-        # if "performance_old" in batch.non_tensor_batch and "performance_new" in batch.non_tensor_batch:
+        # Legacy metric for backward compatibility
         if "performance_new" in batch.non_tensor_batch:
             perf_new = batch.non_tensor_batch["performance_new"]
-            
             cat_perf_new = perf_new[cat_mask]
             
             if len(cat_perf_new) > 0:
-                # Include ALL samples - aborted samples should have 0 performance
                 category_metrics.update({
                     f"train-category/{cat_name}/memory/performance_new/mean": cat_perf_new.mean(),
-                    # f"train-category/{cat_name}/memory/performance_delta/mean": cat_perf_delta.mean(),
-                    # f"train-category/{cat_name}/memory/performance_delta/positive_ratio": (cat_perf_delta > 0).astype(float).mean(),
                 })
+        
+        # New metrics: J (Judge), F1, B1 (BLEU-1)
+        if "J" in batch.non_tensor_batch:
+            j_scores = batch.non_tensor_batch["J"]
+            cat_j_scores = j_scores[cat_mask]
+            if len(cat_j_scores) > 0:
+                category_metrics[f"train-category/{cat_name}/memory/J/mean"] = cat_j_scores.mean()
+        
+        if "F1" in batch.non_tensor_batch:
+            f1_scores = batch.non_tensor_batch["F1"]
+            cat_f1_scores = f1_scores[cat_mask]
+            if len(cat_f1_scores) > 0:
+                category_metrics[f"train-category/{cat_name}/memory/F1/mean"] = cat_f1_scores.mean()
+        
+        if "B1" in batch.non_tensor_batch:
+            b1_scores = batch.non_tensor_batch["B1"]
+            cat_b1_scores = b1_scores[cat_mask]
+            if len(cat_b1_scores) > 0:
+                category_metrics[f"train-category/{cat_name}/memory/B1/mean"] = cat_b1_scores.mean()
     
     # Combine overall and category metrics
     combined_metrics = {**overall_metrics, **category_metrics}

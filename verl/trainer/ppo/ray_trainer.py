@@ -49,7 +49,6 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
-    process_validation_metrics_by_category,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -629,26 +628,28 @@ class RayPPOTrainer:
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
-        data_sources = np.concatenate(data_source_lst, axis=0)
-
-        # Process metrics by category instead of data source
-        cat2var2metric2val = process_validation_metrics_by_category(data_sources, sample_inputs, reward_extra_infos_dict)
+        # Simple validation metrics - just compute means like training
         metric_dict = {}
-        for category, var2metric2val in cat2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{category}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
+        
+        # Overall validation memory metrics
+        for metric in ["J", "F1", "B1", "performance_new"]:
+            if metric in reward_extra_infos_dict and reward_extra_infos_dict[metric]:
+                metric_dict[f"val_memory/{metric}/mean"] = np.mean(reward_extra_infos_dict[metric])
+        
+        # Category-specific memory metrics
+        if "category" in reward_extra_infos_dict:
+            category_names = {1: "multi_hop", 2: "temporal", 3: "open_domain", 4: "single_hop"}
+            categories = reward_extra_infos_dict["category"]
+            
+            for cat_num, cat_name in category_names.items():
+                cat_indices = [i for i, cat in enumerate(categories) if cat == cat_num]
+                if cat_indices:
+                    for metric in ["J", "F1", "B1", "performance_new"]:
+                        if metric in reward_extra_infos_dict:
+                            values = reward_extra_infos_dict[metric]
+                            cat_values = [values[i] for i in cat_indices]
+                            if cat_values:
+                                metric_dict[f"val-category/{cat_name}/memory/{metric}/mean"] = np.mean(cat_values)
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
