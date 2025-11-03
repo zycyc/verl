@@ -214,27 +214,41 @@ class ToolAgentLoop(AgentLoopBase):
                         if group_idx > 0:
                             section_lines.append("")  # Blank line between groups within section
                         
-                        # Add memory group header
-                        section_lines.append(f"--- Memory Group {group_idx + 1} ---")
+                        # Add memory header
+                        section_lines.append(f"-- Memory {memory_counter} --")
                         
-                        # Format previous context
-                        for prev_mem in group["previous"]:
-                            metadata_str = self._format_memory_metadata(prev_mem.get("metadata", {}))
-                            section_lines.append(f"Memory {memory_counter} [CONTEXT]{metadata_str}: {prev_mem.get('content', '')}")
-                            memory_counter += 1
+                        # Get timestamp from the main result for filtering
+                        result_mem = group["result"]
+                        if result_mem:
+                            result_timestamp = result_mem.get("metadata", {}).get("timestamp")
+                            
+                            # Collect all memories that share the same timestamp
+                            same_timestamp_memories = []
+                            
+                            # Add previous context with matching timestamp
+                            for prev_mem in group["previous"]:
+                                if prev_mem.get("metadata", {}).get("timestamp") == result_timestamp:
+                                    same_timestamp_memories.append(prev_mem)
+                            
+                            # Add main result
+                            same_timestamp_memories.append(result_mem)
+                            
+                            # Add next context with matching timestamp
+                            for next_mem in group["next"]:
+                                if next_mem.get("metadata", {}).get("timestamp") == result_timestamp:
+                                    same_timestamp_memories.append(next_mem)
+                            
+                            # Display timestamp once at the top if available
+                            if result_timestamp:
+                                section_lines.append(f"[{result_timestamp}]")
+                            
+                            # Format each memory as [Speaker]: content
+                            for mem in same_timestamp_memories:
+                                speaker = mem.get("metadata", {}).get("speaker", "Unknown")
+                                content = mem.get("content", "")
+                                section_lines.append(f"{speaker}: {content}")
                         
-                        # Format main result
-                        if group["result"]:
-                            result_mem = group["result"]
-                            metadata_str = self._format_memory_metadata(result_mem.get("metadata", {}))
-                            section_lines.append(f"Memory {memory_counter}{metadata_str}: {result_mem.get('content', '')}")
-                            memory_counter += 1
-                        
-                        # Format next context
-                        for next_mem in group["next"]:
-                            metadata_str = self._format_memory_metadata(next_mem.get("metadata", {}))
-                            section_lines.append(f"Memory {memory_counter} [CONTEXT]{metadata_str}: {next_mem.get('content', '')}")
-                            memory_counter += 1
+                        memory_counter += 1
                     
                     formatted_sections.append("\n".join(section_lines))
             
