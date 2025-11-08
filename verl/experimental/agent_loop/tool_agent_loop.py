@@ -321,40 +321,39 @@ class ToolAgentLoop(AgentLoopBase):
         # 🔧 MEMUPDATE: Retrieve initial RAG context and add to messages
         target_question = extra_info.get("target_question", "")
         if trial_namespace and sample_id and target_question:
-            initial_context = await self._retrieve_initial_context(target_question, sample_id, trial_namespace)
-            if initial_context:
-                # Add context as a user message
-                context_message = {
-                    "role": "user", 
-                    "content": f"Here is some relevant context from the conversation database that may help answer the question:\n\n{initial_context}\n\nNow, please search for more specific information and submit your final answer using the submit_answer tool."
-                }
-                messages.append(context_message)
-                
-                # Regenerate prompt_ids with the updated messages
-                if self.processor is not None:
-                    raw_prompt = await self.loop.run_in_executor(
-                        None,
-                        lambda: self.processor.apply_chat_template(
-                            messages,
-                            tools=self.tool_schemas,
-                            add_generation_prompt=True,
-                            tokenize=False,
-                            **self.apply_chat_template_kwargs,
-                        ),
-                    )
-                    model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
-                    prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
-                else:
-                    prompt_ids = await self.loop.run_in_executor(
-                        None,
-                        lambda: self.tokenizer.apply_chat_template(
-                            messages,
-                            tools=self.tool_schemas,
-                            add_generation_prompt=True,
-                            tokenize=True,
-                            **self.apply_chat_template_kwargs,
-                        ),
-                    )
+            # initial_context = await self._retrieve_initial_context(target_question, sample_id, trial_namespace)
+            # # Add context as a user message
+            # context_message = {
+            #     "role": "user", 
+            #     "content": f"Here is some relevant context from the conversation database that may help answer the question:\n\n{initial_context}\n\nNow, please search for more specific information and submit your final answer using the submit_answer tool."
+            # }
+            # messages.append(context_message)
+            
+            # Regenerate prompt_ids with the updated messages
+            if self.processor is not None:
+                raw_prompt = await self.loop.run_in_executor(
+                    None,
+                    lambda: self.processor.apply_chat_template(
+                        messages,
+                        tools=self.tool_schemas,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        **self.apply_chat_template_kwargs,
+                    ),
+                )
+                model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
+                prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+            else:
+                prompt_ids = await self.loop.run_in_executor(
+                    None,
+                    lambda: self.tokenizer.apply_chat_template(
+                        messages,
+                        tools=self.tool_schemas,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        **self.apply_chat_template_kwargs,
+                    ),
+                )
 
         user_turns, assistant_turns = 0, 0
         termination_reason = "COMPLETED"  # Default to completed
